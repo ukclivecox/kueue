@@ -1,3 +1,5 @@
+{{- $integrationsConfig := (fromYaml .Values.managerConfig.controllerManagerConfigYaml).integrations }}
+{{- if has "ray.io/rayjob" $integrationsConfig.frameworks }}
 # permissions for end users to edit jobs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -26,3 +28,4 @@ rules:
       - rayjobs/status
     verbs:
       - get
+{{- end }}

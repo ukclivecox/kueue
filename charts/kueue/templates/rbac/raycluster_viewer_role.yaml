@@ -1,3 +1,5 @@
+{{- $integrationsConfig := (fromYaml .Values.managerConfig.controllerManagerConfigYaml).integrations }}
+{{- if has "ray.io/raycluster" $integrationsConfig.frameworks }}
 # permissions for end users to view jobs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -21,3 +23,4 @@ rules:
       - rayclusters/status
     verbs:
       - get
+{{- end }}

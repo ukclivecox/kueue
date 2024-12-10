@@ -150,3 +150,8 @@ webhookService:
       protocol: TCP
       targetPort: 9443
   type: ClusterIP
+  namespaceSelector:
+    matchExpressions:
+    - key: kubernetes.io/metadata.name
+      operator: In
+      values: [ ray ]

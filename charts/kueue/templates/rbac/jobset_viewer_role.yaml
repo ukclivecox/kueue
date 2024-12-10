@@ -1,3 +1,5 @@
+{{- $integrationsConfig := (fromYaml .Values.managerConfig.controllerManagerConfigYaml).integrations }}
+{{- if has "jobset.x-k8s.io/jobset" $integrationsConfig.frameworks }}
 # permissions for end users to view jobsets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -22,3 +24,4 @@ rules:
       - jobsets/status
     verbs:
       - get
+{{- end }}
