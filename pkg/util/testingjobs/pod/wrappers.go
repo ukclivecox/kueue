@@ -31,7 +31,6 @@ import (
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 	"sigs.k8s.io/kueue/pkg/constants"
 	controllerconsts "sigs.k8s.io/kueue/pkg/controller/constants"
-	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 )
 
 // PodWrapper wraps a Pod.
@@ -101,6 +100,10 @@ func (p *PodWrapper) Queue(q string) *PodWrapper {
 	return p.Label(controllerconsts.QueueLabel, q)
 }
 
+func (p *PodWrapper) PrebuildWorkload(name string) *PodWrapper {
+	return p.Label(controllerconsts.PrebuiltWorkloadLabel, name)
+}
+
 // PriorityClass updates the priority class name of the Pod
 func (p *PodWrapper) PriorityClass(pc string) *PodWrapper {
 	p.Spec.PriorityClassName = pc
@@ -110,6 +113,12 @@ func (p *PodWrapper) PriorityClass(pc string) *PodWrapper {
 // Name updated the name of the pod
 func (p *PodWrapper) Name(n string) *PodWrapper {
 	p.ObjectMeta.Name = n
+	return p
+}
+
+// Namespace updates the namespace of the Pod.
+func (p *PodWrapper) Namespace(n string) *PodWrapper {
+	p.ObjectMeta.Namespace = n
 	return p
 }
 
@@ -162,8 +171,12 @@ func (p *PodWrapper) TopologySchedulingGate() *PodWrapper {
 }
 
 // Gate adds kueue scheduling gate to the Pod by the gate name
-func (p *PodWrapper) Gate(gateName string) *PodWrapper {
-	utilpod.Gate(&p.Pod, gateName)
+func (p *PodWrapper) Gate(gateNames ...string) *PodWrapper {
+	for _, gate := range gateNames {
+		p.Pod.Spec.SchedulingGates = append(p.Pod.Spec.SchedulingGates, corev1.PodSchedulingGate{
+			Name: gate,
+		})
+	}
 	return p
 }
 
@@ -200,6 +213,11 @@ func (p *PodWrapper) NodeName(name string) *PodWrapper {
 // Request adds a resource request to the default container.
 func (p *PodWrapper) Request(r corev1.ResourceName, v string) *PodWrapper {
 	p.Spec.Containers[0].Resources.Requests[r] = resource.MustParse(v)
+	return p
+}
+
+func (p *PodWrapper) ServiceAccountName(serviceAccountName string) *PodWrapper {
+	p.Spec.ServiceAccountName = serviceAccountName
 	return p
 }
 

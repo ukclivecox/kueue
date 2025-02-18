@@ -53,11 +53,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for Pod group", func() {
 			clusterQueue *kueue.ClusterQueue
 		)
 		ginkgo.BeforeEach(func() {
-			topology = testing.MakeTopology("datacenter").Levels(
-				topologyLevelBlock,
-				topologyLevelRack,
-				corev1.LabelHostname,
-			).Obj()
+			topology = testing.MakeDefaultThreeLevelTopology("datacenter")
 			gomega.Expect(k8sClient.Create(ctx, topology)).Should(gomega.Succeed())
 
 			tasFlavor = testing.MakeResourceFlavor("tas-flavor").
@@ -84,6 +80,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for Pod group", func() {
 			util.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
 			util.ExpectObjectToBeDeleted(ctx, k8sClient, tasFlavor, true)
 			util.ExpectObjectToBeDeleted(ctx, k8sClient, topology, true)
+			util.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
 		})
 
 		ginkgo.It("Should place pods based on the ranks-ordering", func() {
@@ -93,7 +90,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for Pod group", func() {
 				Queue("test-queue").
 				Request(extraResource, "1").
 				Limit(extraResource, "1").
-				Annotation(kueuealpha.PodSetRequiredTopologyAnnotation, "cloud.provider.com/topology-block")
+				Annotation(kueuealpha.PodSetRequiredTopologyAnnotation, testing.DefaultBlockTopologyLevel)
 			podGroup := basePod.MakeIndexedGroup(numPods)
 
 			for _, pod := range podGroup {

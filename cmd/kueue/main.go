@@ -41,6 +41,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta1"
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
@@ -113,22 +115,45 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-
-	if err := utilfeature.DefaultMutableFeatureGate.Set(featureGates); err != nil {
-		setupLog.Error(err, "Unable to set flag gates for known features")
-		os.Exit(1)
-	}
-
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-	setupLog.Info("Initializing", "gitVersion", version.GitVersion, "gitCommit", version.GitCommit)
-
-	features.LogFeatureGates(setupLog)
 
 	options, cfg, err := apply(configFile)
 	if err != nil {
 		setupLog.Error(err, "Unable to load the configuration")
 		os.Exit(1)
 	}
+
+	if err := config.ValidateFeatureGates(featureGates, cfg.FeatureGates); err != nil {
+		setupLog.Error(err, "conflicting feature gates detected")
+		os.Exit(1)
+	}
+
+	if featureGates != "" {
+		if err := utilfeature.DefaultMutableFeatureGate.Set(featureGates); err != nil {
+			setupLog.Error(err, "Unable to set flag gates for known features")
+			os.Exit(1)
+		}
+	} else {
+		if err := utilfeature.DefaultMutableFeatureGate.SetFromMap(cfg.FeatureGates); err != nil {
+			setupLog.Error(err, "Unable to set flag gates for known features")
+			os.Exit(1)
+		}
+	}
+
+	setupLog.Info("Initializing", "gitVersion", version.GitVersion, "gitCommit", version.GitCommit)
+
+	features.LogFeatureGates(setupLog)
+
+	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
+	// More info:
+	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/metrics/server
+	// - https://book.kubebuilder.io/reference/metrics.html
+	metricsServerOptions := metricsserver.Options{
+		BindAddress:    cfg.Metrics.BindAddress,
+		SecureServing:  true,
+		FilterProvider: filters.WithAuthenticationAndAuthorization,
+	}
+	options.Metrics = metricsServerOptions
 
 	metrics.Register()
 
@@ -212,8 +237,8 @@ func setupIndexes(ctx context.Context, mgr ctrl.Manager, cfg *configapi.Configur
 
 	// setup provision admission check controller indexes
 	if features.Enabled(features.ProvisioningACC) {
-		if !provisioning.ServerSupportsProvisioningRequest(mgr) {
-			setupLog.Error(nil, "Provisioning Requests are not supported, skipped admission check controller setup")
+		if err := provisioning.ServerSupportsProvisioningRequest(mgr); err != nil {
+			setupLog.Error(err, "Skipping admission check controller setup: Provisioning Requests not supported (Possible cause: missing or unsupported cluster-autoscaler)")
 		} else if err := provisioning.SetupIndexer(ctx, mgr.GetFieldIndexer()); err != nil {
 			setupLog.Error(err, "Could not setup provisioning indexer")
 			os.Exit(1)
@@ -251,17 +276,20 @@ func setupControllers(ctx context.Context, mgr ctrl.Manager, cCache *cache.Cache
 	}
 
 	// setup provision admission check controller
-	if features.Enabled(features.ProvisioningACC) && provisioning.ServerSupportsProvisioningRequest(mgr) {
-		// A info message is added in setupIndexes if autoscaling is not supported by the cluster
-		ctrl, err := provisioning.NewController(mgr.GetClient(), mgr.GetEventRecorderFor("kueue-provisioning-request-controller"))
-		if err != nil {
-			setupLog.Error(err, "Could not create the provisioning controller")
-			os.Exit(1)
-		}
+	if features.Enabled(features.ProvisioningACC) {
+		if err := provisioning.ServerSupportsProvisioningRequest(mgr); err != nil {
+			setupLog.Info("Skipping provisioning controller setup: Provisioning Requests not supported (Possible cause: missing or unsupported cluster-autoscaler)")
+		} else {
+			ctrl, err := provisioning.NewController(mgr.GetClient(), mgr.GetEventRecorderFor("kueue-provisioning-request-controller"))
+			if err != nil {
+				setupLog.Error(err, "Could not create the provisioning controller")
+				os.Exit(1)
+			}
 
-		if err := ctrl.SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Could not setup provisioning controller")
-			os.Exit(1)
+			if err := ctrl.SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "Could not setup provisioning controller")
+				os.Exit(1)
+			}
 		}
 	}
 

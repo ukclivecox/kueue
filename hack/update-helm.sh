@@ -103,6 +103,8 @@ search_webhook_pod_mutate="        path: /mutate--v1-pod"
 search_webhook_pod_validate="        path: /validate--v1-pod"
 search_webhook_deployment_mutate="        path: /mutate-apps-v1-deployment"
 search_webhook_deployment_validate="        path: /validate-apps-v1-deployment"
+search_webhook_statefulset_mutate="        path: /mutate-apps-v1-statefulset"
+search_webhook_statefulset_validate="        path: /validate-apps-v1-statefulset"
 search_mutate_webhook_annotations='  name: '\''{{ include "kueue.fullname" . }}-mutating-webhook-configuration'\'''
 search_validate_webhook_annotations='  name: '\''{{ include "kueue.fullname" . }}-validating-webhook-configuration'\'''
 add_webhook_line=$(
@@ -187,6 +189,40 @@ add_webhook_deployment_validate=$(
     failurePolicy: Ignore
     {{- end }}
     name: vdeployment.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - '{{ .Release.Namespace }}'
+EOF
+)
+add_webhook_statefulset_mutate=$(
+  cat <<'EOF'
+    {{- if has "statefulset" $integrationsConfig.frameworks }}
+    failurePolicy: Fail
+    {{- else }}
+    failurePolicy: Ignore
+    {{- end }}
+    name: mstatefulset.kb.io
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - '{{ .Release.Namespace }}'
+EOF
+)
+add_webhook_statefulset_validate=$(
+  cat <<'EOF'
+    {{- if has "statefulset" $integrationsConfig.frameworks }}
+    failurePolicy: Fail
+    {{- else }}
+    failurePolicy: Ignore
+    {{- end }}
+    name: vstatefulset.kb.io
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name
@@ -306,6 +342,14 @@ for output_file in "${new_files[@]}"; do
       count=$((count+2))
       echo "$add_webhook_deployment_validate" >>"$output_file"
     fi
+    if [[ $line == "$search_webhook_statefulset_mutate" ]]; then
+      count=$((count+2))
+      echo "$add_webhook_statefulset_mutate" >>"$output_file"
+    fi
+    if [[ $line == "$search_webhook_statefulset_validate" ]]; then
+      count=$((count+2))
+      echo "$add_webhook_statefulset_validate" >>"$output_file"
+    fi
   done < "$input_file"
   rm "$input_file"
 done
@@ -350,7 +394,6 @@ done
 
 # Replace flowcontrol version on visibility-apf directory
 for output_file in "${DEST_VISIBILITY_APF_DIR}"/*.yaml; do
-  $YQ -N -i '.apiVersion = "flowcontrol.apiserver.k8s.io/{{ and (eq .Capabilities.KubeVersion.Major \"1\") (eq .Capabilities.KubeVersion.Minor \"28\") | ternary \"v1beta3\" \"v1\" }}"' "$output_file"
   $YQ -N -i '.metadata.name |= "{{ include \"kueue.fullname\" . }}-" + .' "$output_file"
   $YQ -N -i '.metadata.namespace = "{{ .Release.Namespace }}"' "$output_file"
   $SED -i '/^metadata:.*/a\  labels:\n  {{- include "kueue.labels" . | nindent 4 }}' "$output_file"

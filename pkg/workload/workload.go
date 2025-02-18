@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
+	resourcehelpers "k8s.io/component-helpers/resource"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
@@ -44,8 +45,6 @@ import (
 	"sigs.k8s.io/kueue/pkg/metrics"
 	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/util/api"
-	"sigs.k8s.io/kueue/pkg/util/limitrange"
-	utilmaps "sigs.k8s.io/kueue/pkg/util/maps"
 	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
 )
 
@@ -183,6 +182,8 @@ type TopologyRequest struct {
 type TopologyDomainRequests struct {
 	Values   []string
 	Requests resources.Requests
+	// Count indicates how many pods are requested in this TopologyDomain.
+	Count int32
 }
 
 func (psr *PodSetResources) ScaledTo(newCount int32) *PodSetResources {
@@ -378,7 +379,7 @@ func totalRequestsFromPodSets(wl *kueue.Workload, info *InfoOptions) []PodSetRes
 			Name:  ps.Name,
 			Count: count,
 		}
-		specRequests := limitrange.TotalRequests(&ps.Template.Spec)
+		specRequests := resourcehelpers.PodRequests(&corev1.Pod{Spec: ps.Template.Spec}, resourcehelpers.PodResourcesOptions{})
 		effectiveRequests := dropExcludedResources(specRequests, info.excludedResourcePrefixes)
 		if features.Enabled(features.ConfigurableResourceTransformations) {
 			effectiveRequests = applyResourceTransformations(effectiveRequests, info.resourceTransformations)
@@ -415,6 +416,7 @@ func totalRequestsFromAdmission(wl *kueue.Workload) []PodSetResources {
 				setRes.TopologyRequest.DomainRequests = append(setRes.TopologyRequest.DomainRequests, TopologyDomainRequests{
 					Values:   domain.Values,
 					Requests: domainRequests,
+					Count:    domain.Count,
 				})
 			}
 		}
@@ -453,8 +455,9 @@ func UpdateStatus(ctx context.Context,
 	conditionType string,
 	conditionStatus metav1.ConditionStatus,
 	reason, message string,
-	managerPrefix string) error {
-	now := metav1.Now()
+	managerPrefix string,
+	clock clock.Clock) error {
+	now := metav1.NewTime(clock.Now())
 	condition := metav1.Condition{
 		Type:               conditionType,
 		Status:             conditionStatus,
@@ -568,7 +571,7 @@ func BaseSSAWorkload(w *kueue.Workload) *kueue.Workload {
 
 // SetQuotaReservation applies the provided admission to the workload.
 // The WorkloadAdmitted and WorkloadEvicted are added or updated if necessary.
-func SetQuotaReservation(w *kueue.Workload, admission *kueue.Admission) {
+func SetQuotaReservation(w *kueue.Workload, admission *kueue.Admission, clock clock.Clock) {
 	w.Status.Admission = admission
 	message := fmt.Sprintf("Quota reserved in ClusterQueue %s", w.Status.Admission.ClusterQueue)
 	admittedCond := metav1.Condition{
@@ -585,14 +588,14 @@ func SetQuotaReservation(w *kueue.Workload, admission *kueue.Admission) {
 		evictedCond.Status = metav1.ConditionFalse
 		evictedCond.Reason = "QuotaReserved"
 		evictedCond.Message = api.TruncateConditionMessage("Previously: " + evictedCond.Message)
-		evictedCond.LastTransitionTime = metav1.Now()
+		evictedCond.LastTransitionTime = metav1.NewTime(clock.Now())
 	}
 	// reset Preempted condition if present.
 	if preemptedCond := apimeta.FindStatusCondition(w.Status.Conditions, kueue.WorkloadPreempted); preemptedCond != nil {
 		preemptedCond.Status = metav1.ConditionFalse
 		preemptedCond.Reason = "QuotaReserved"
 		preemptedCond.Message = api.TruncateConditionMessage("Previously: " + preemptedCond.Message)
-		preemptedCond.LastTransitionTime = metav1.Now()
+		preemptedCond.LastTransitionTime = metav1.NewTime(clock.Now())
 	}
 }
 
@@ -631,9 +634,6 @@ func SetEvictedCondition(w *kueue.Workload, reason string, message string) {
 // PropagateResourceRequests synchronizes w.Status.ResourceRequests to
 // with info.TotalRequests if the feature gate is enabled and returns true if w was updated
 func PropagateResourceRequests(w *kueue.Workload, info *Info) bool {
-	if !features.Enabled(features.WorkloadResourceRequestsSummary) {
-		return false
-	}
 	if len(w.Status.ResourceRequests) == len(info.TotalRequests) {
 		match := true
 		for idx := range w.Status.ResourceRequests {
@@ -682,22 +682,22 @@ func AdmissionStatusPatch(w *kueue.Workload, wlCopy *kueue.Workload, strict bool
 	wlCopy.Status.AccumulatedPastExexcutionTimeSeconds = w.Status.AccumulatedPastExexcutionTimeSeconds
 }
 
-func AdmissionChecksStatusPatch(w *kueue.Workload, wlCopy *kueue.Workload) {
+func AdmissionChecksStatusPatch(w *kueue.Workload, wlCopy *kueue.Workload, c clock.Clock) {
 	if wlCopy.Status.AdmissionChecks == nil && w.Status.AdmissionChecks != nil {
 		wlCopy.Status.AdmissionChecks = make([]kueue.AdmissionCheckState, 0)
 	}
 	for _, ac := range w.Status.AdmissionChecks {
-		SetAdmissionCheckState(&wlCopy.Status.AdmissionChecks, ac)
+		SetAdmissionCheckState(&wlCopy.Status.AdmissionChecks, ac, c)
 	}
 }
 
 // ApplyAdmissionStatus updated all the admission related status fields of a workload with SSA.
 // If strict is true, resourceVersion will be part of the patch, make this call fail if Workload
 // was changed.
-func ApplyAdmissionStatus(ctx context.Context, c client.Client, w *kueue.Workload, strict bool) error {
+func ApplyAdmissionStatus(ctx context.Context, c client.Client, w *kueue.Workload, strict bool, clk clock.Clock) error {
 	wlCopy := BaseSSAWorkload(w)
 	AdmissionStatusPatch(w, wlCopy, strict)
-	AdmissionChecksStatusPatch(w, wlCopy)
+	AdmissionChecksStatusPatch(w, wlCopy, clk)
 	return ApplyAdmissionStatusPatch(ctx, c, wlCopy)
 }
 
@@ -818,7 +818,7 @@ func AdmissionChecksForWorkload(log logr.Logger, wl *kueue.Workload, admissionCh
 		}
 	}
 	if allFlavors {
-		return sets.New(utilmaps.Keys(admissionChecks)...)
+		return sets.New(slices.Collect(maps.Keys(admissionChecks))...)
 	}
 
 	// Kueue sets AdmissionChecks first based on ClusterQueue configuration and at this point Workload has no

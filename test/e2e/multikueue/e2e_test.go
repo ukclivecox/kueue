@@ -18,13 +18,19 @@ package mke2e
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"regexp"
+	"runtime"
 
 	"github.com/google/go-cmp/cmp/cmpopts"
 	kfmpi "github.com/kubeflow/mpi-operator/pkg/apis/kubeflow/v2beta1"
 	kftraining "github.com/kubeflow/training-operator/pkg/apis/kubeflow.org/v1"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	awv1beta2 "github.com/project-codeflare/appwrapper/api/v1beta2"
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -36,15 +42,25 @@ import (
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
+	workloadaw "sigs.k8s.io/kueue/pkg/controller/jobs/appwrapper"
 	workloadjob "sigs.k8s.io/kueue/pkg/controller/jobs/job"
 	workloadjobset "sigs.k8s.io/kueue/pkg/controller/jobs/jobset"
 	workloadpytorchjob "sigs.k8s.io/kueue/pkg/controller/jobs/kubeflow/jobs/pytorchjob"
 	workloadmpijob "sigs.k8s.io/kueue/pkg/controller/jobs/mpijob"
+	workloadpod "sigs.k8s.io/kueue/pkg/controller/jobs/pod"
+	workloadraycluster "sigs.k8s.io/kueue/pkg/controller/jobs/raycluster"
+	workloadrayjob "sigs.k8s.io/kueue/pkg/controller/jobs/rayjob"
+	utilpod "sigs.k8s.io/kueue/pkg/util/pod"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
+	testingaw "sigs.k8s.io/kueue/pkg/util/testingjobs/appwrapper"
+	testingdeployment "sigs.k8s.io/kueue/pkg/util/testingjobs/deployment"
 	testingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
 	testingjobset "sigs.k8s.io/kueue/pkg/util/testingjobs/jobset"
 	testingmpijob "sigs.k8s.io/kueue/pkg/util/testingjobs/mpijob"
+	testingpod "sigs.k8s.io/kueue/pkg/util/testingjobs/pod"
 	testingpytorchjob "sigs.k8s.io/kueue/pkg/util/testingjobs/pytorchjob"
+	testingraycluster "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
+	testingrayjob "sigs.k8s.io/kueue/pkg/util/testingjobs/rayjob"
 	"sigs.k8s.io/kueue/pkg/workload"
 	"sigs.k8s.io/kueue/test/util"
 )
@@ -187,6 +203,189 @@ var _ = ginkgo.Describe("MultiKueue", func() {
 	})
 
 	ginkgo.When("Creating a multikueue admission check", func() {
+		ginkgo.It("Should create a pod on worker if admitted", func() {
+			pod := testingpod.MakePod("pod", managerNs.Name).
+				Image(util.E2eTestSleepImage, []string{"1ms"}).
+				Request("cpu", "1").
+				Request("memory", "2G").
+				Queue(managerLq.Name).
+				Obj()
+				// Since it requires 2G of memory, this pod can only be admitted in worker 2.
+
+			ginkgo.By("Creating the pod", func() {
+				gomega.Expect(k8sManagerClient.Create(ctx, pod)).Should(gomega.Succeed())
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdPod := &corev1.Pod{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(pod), createdPod)).To(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			createdLeaderWorkload := &kueue.Workload{}
+			wlLookupKey := types.NamespacedName{Name: workloadpod.GetWorkloadNameForPod(pod.Name, pod.UID), Namespace: managerNs.Name}
+
+			// the execution should be given to worker2
+			ginkgo.By("Waiting to be admitted in worker2", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sManagerClient.Get(ctx, wlLookupKey, createdLeaderWorkload)).To(gomega.Succeed())
+					g.Expect(workload.FindAdmissionCheck(createdLeaderWorkload.Status.AdmissionChecks, multiKueueAc.Name)).To(gomega.BeComparableTo(&kueue.AdmissionCheckState{
+						Name:    multiKueueAc.Name,
+						State:   kueue.CheckStatePending,
+						Message: `The workload got reservation on "worker2"`,
+					}, cmpopts.IgnoreFields(kueue.AdmissionCheckState{}, "LastTransitionTime")))
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdPod := &corev1.Pod{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(pod), createdPod)).To(gomega.Succeed())
+					g.Expect(utilpod.HasGate(createdPod, "kueue.x-k8s.io/admission")).To(gomega.BeTrue())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+			finishReason := "PodCompleted"
+			finishPodConditions := []corev1.PodCondition{
+				{
+					Type:   corev1.PodReadyToStartContainers,
+					Status: corev1.ConditionFalse,
+					Reason: "",
+				},
+				{
+					Type:   corev1.PodInitialized,
+					Status: corev1.ConditionTrue,
+					Reason: finishReason},
+				{
+					Type:   corev1.PodReady,
+					Status: corev1.ConditionFalse,
+					Reason: finishReason,
+				},
+				{
+					Type:   corev1.ContainersReady,
+					Status: corev1.ConditionFalse,
+					Reason: finishReason},
+				{
+					Type:   corev1.PodScheduled,
+					Status: corev1.ConditionTrue,
+					Reason: "",
+				},
+			}
+			ginkgo.By("Waiting for the pod to get status updates", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdPod := corev1.Pod{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(pod), &createdPod)).To(gomega.Succeed())
+					g.Expect(createdPod.Status.Phase).To(gomega.Equal(corev1.PodSucceeded))
+					g.Expect(createdPod.Status.Conditions).To(gomega.BeComparableTo(finishPodConditions, cmpopts.IgnoreFields(corev1.PodCondition{}, "LastTransitionTime")))
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+		})
+
+		ginkgo.It("Should create pods on worker if the deployment is admitted", func() {
+			var kubernetesClients = map[string]client.Client{
+				"worker1": k8sWorker1Client,
+				"worker2": k8sWorker2Client,
+			}
+
+			deployment := testingdeployment.MakeDeployment("deployment", managerNs.Name).
+				Image(util.E2eTestSleepImage, []string{"10m"}).
+				Replicas(3).
+				Queue(managerLq.Name).
+				Obj()
+
+			ginkgo.By("Creating the deployment", func() {
+				gomega.Expect(k8sManagerClient.Create(ctx, deployment)).Should(gomega.Succeed())
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdDeployment := &appsv1.Deployment{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), createdDeployment)).To(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Wait for replicas ready", func() {
+				createdDeployment := &appsv1.Deployment{}
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), createdDeployment)).To(gomega.Succeed())
+					g.Expect(createdDeployment.Status.ReadyReplicas).To(gomega.Equal(int32(3)))
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Ensure Pod Workloads are created and Pods are Running on the worker cluster", func() {
+				ensurePodWorkloadsRunning(deployment, *managerNs, multiKueueAc, kubernetesClients)
+			})
+
+			deploymentConditions := []appsv1.DeploymentCondition{
+				{
+					Type:    appsv1.DeploymentAvailable,
+					Status:  corev1.ConditionTrue,
+					Reason:  "MinimumReplicasAvailable",
+					Message: "Deployment has minimum availability.",
+				},
+				{
+					Type:   appsv1.DeploymentProgressing,
+					Status: corev1.ConditionTrue,
+					Reason: "NewReplicaSetAvailable",
+				},
+			}
+
+			ginkgo.By("Waiting for the deployment to get status updates", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdDeployment := appsv1.Deployment{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), &createdDeployment)).To(gomega.Succeed())
+					g.Expect(createdDeployment.Status.ReadyReplicas).To(gomega.Equal(int32(3)))
+					g.Expect(createdDeployment.Status.Replicas).To(gomega.Equal(int32(3)))
+					g.Expect(createdDeployment.Status.UpdatedReplicas).To(gomega.Equal(int32(3)))
+					g.Expect(createdDeployment.Status.Conditions).To(gomega.BeComparableTo(deploymentConditions, cmpopts.IgnoreFields(appsv1.DeploymentCondition{}, "LastTransitionTime", "LastUpdateTime", "Message"))) // Ignoring message as it is required to gather the pod replica set
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Increasing the replica count on the deployment", func() {
+				createdDeployment := &appsv1.Deployment{}
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), createdDeployment)).To(gomega.Succeed())
+					createdDeployment.Spec.Replicas = ptr.To[int32](4)
+					g.Expect(k8sManagerClient.Update(ctx, createdDeployment)).To(gomega.Succeed())
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+
+				ginkgo.By("Wait for replicas ready", func() {
+					createdDeployment := &appsv1.Deployment{}
+					gomega.Eventually(func(g gomega.Gomega) {
+						g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), createdDeployment)).To(gomega.Succeed())
+						g.Expect(createdDeployment.Status.ReadyReplicas).To(gomega.Equal(int32(4)))
+					}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+				})
+			})
+
+			ginkgo.By("Ensure Pod Workloads are created and Pods are Running on the worker cluster", func() {
+				ensurePodWorkloadsRunning(deployment, *managerNs, multiKueueAc, kubernetesClients)
+			})
+
+			ginkgo.By("Decreasing the replica count on the deployment", func() {
+				createdDeployment := &appsv1.Deployment{}
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), createdDeployment)).To(gomega.Succeed())
+					createdDeployment.Spec.Replicas = ptr.To[int32](2)
+					g.Expect(k8sManagerClient.Update(ctx, createdDeployment)).To(gomega.Succeed())
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+
+				ginkgo.By("Wait for replicas ready", func() {
+					createdDeployment := &appsv1.Deployment{}
+					gomega.Eventually(func(g gomega.Gomega) {
+						g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(deployment), createdDeployment)).To(gomega.Succeed())
+						g.Expect(createdDeployment.Status.ReadyReplicas).To(gomega.Equal(int32(2)))
+					}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+				})
+			})
+
+			ginkgo.By("Ensure Pod Workloads are created and Pods are Running on the worker cluster", func() {
+				ensurePodWorkloadsRunning(deployment, *managerNs, multiKueueAc, kubernetesClients)
+			})
+
+			ginkgo.By("Deleting the deployment all pods should be deleted", func() {
+				gomega.Expect(k8sManagerClient.Delete(ctx, deployment)).Should(gomega.Succeed())
+				for _, workerClient := range kubernetesClients {
+					pods := &corev1.PodList{}
+					gomega.Eventually(func(g gomega.Gomega) {
+						g.Expect(workerClient.List(ctx, pods, client.InNamespace(managerNs.Namespace), client.MatchingLabels(deployment.Spec.Selector.MatchLabels))).To(gomega.Succeed())
+						g.Expect(pods.Items).To(gomega.BeEmpty())
+					}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+				}
+			})
+		})
 		ginkgo.It("Should run a job on worker if admitted", func() {
 			if managerK8SVersion.LessThan(versionutil.MustParseSemantic("1.30.0")) {
 				ginkgo.Skip("the managers kubernetes version is less then 1.30")
@@ -368,9 +567,71 @@ var _ = ginkgo.Describe("MultiKueue", func() {
 			})
 		})
 
+		ginkgo.It("Should run an appwrapper containing a job on worker if admitted", func() {
+			// Since it requires 2 CPU in total, this appwrapper can only be admitted in worker 1.
+			aw := testingaw.MakeAppWrapper("aw", managerNs.Name).
+				Queue(managerLq.Name).
+				Component(testingjob.MakeJob("job-1", managerNs.Name).
+					SetTypeMeta().
+					Suspend(false).
+					Image(util.E2eTestSleepImage, []string{"5s"}). // Give it the time to be observed Active in the live status update step.
+					Parallelism(2).
+					Request(corev1.ResourceCPU, "1").
+					SetTypeMeta().Obj()).
+				Obj()
+
+			ginkgo.By("Creating the appwrapper", func() {
+				gomega.Expect(k8sManagerClient.Create(ctx, aw)).Should(gomega.Succeed())
+			})
+
+			createdWorkload := &kueue.Workload{}
+			wlLookupKey := types.NamespacedName{Name: workloadaw.GetWorkloadNameForAppWrapper(aw.Name, aw.UID), Namespace: managerNs.Name}
+
+			// the execution should be given to worker 1
+			waitForJobAdmitted(wlLookupKey, multiKueueAc.Name, "worker1")
+
+			ginkgo.By("Waiting for the appwrapper to get status updates", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdAppWrapper := &awv1beta2.AppWrapper{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(aw), createdAppWrapper)).To(gomega.Succeed())
+					g.Expect(createdAppWrapper.Status.Phase).To(gomega.Equal(awv1beta2.AppWrapperRunning))
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Waiting for the appwrapper to finish", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sManagerClient.Get(ctx, wlLookupKey, createdWorkload)).To(gomega.Succeed())
+
+					g.Expect(apimeta.FindStatusCondition(createdWorkload.Status.Conditions, kueue.WorkloadFinished)).To(gomega.BeComparableTo(&metav1.Condition{
+						Type:    kueue.WorkloadFinished,
+						Status:  metav1.ConditionTrue,
+						Reason:  kueue.WorkloadFinishedReasonSucceeded,
+						Message: "AppWrapper finished successfully",
+					}, util.IgnoreConditionTimestampsAndObservedGeneration))
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Checking no objects are left in the worker clusters and the appwrapper is completed", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					workerWl := &kueue.Workload{}
+					g.Expect(k8sWorker1Client.Get(ctx, wlLookupKey, workerWl)).To(utiltesting.BeNotFoundError())
+					g.Expect(k8sWorker2Client.Get(ctx, wlLookupKey, workerWl)).To(utiltesting.BeNotFoundError())
+					workerAppWrapper := &awv1beta2.AppWrapper{}
+					g.Expect(k8sWorker1Client.Get(ctx, client.ObjectKeyFromObject(aw), workerAppWrapper)).To(utiltesting.BeNotFoundError())
+					g.Expect(k8sWorker2Client.Get(ctx, client.ObjectKeyFromObject(aw), workerAppWrapper)).To(utiltesting.BeNotFoundError())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+
+				createdAppWrapper := &awv1beta2.AppWrapper{}
+				gomega.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(aw), createdAppWrapper)).To(gomega.Succeed())
+				gomega.Expect(createdAppWrapper.Spec.Suspend).To(gomega.BeFalse())
+				gomega.Expect(createdAppWrapper.Status.Phase).To(gomega.Equal(awv1beta2.AppWrapperSucceeded))
+			})
+		})
+
 		ginkgo.It("Should run a kubeflow PyTorchJob on worker if admitted", func() {
 			// Since it requires 1600M of memory, this job can only be admitted in worker 2.
 			pyTorchJob := testingpytorchjob.MakePyTorchJob("pytorchjob1", managerNs.Name).
+				ManagedBy(kueue.MultiKueueControllerName).
 				Queue(managerLq.Name).
 				PyTorchReplicaSpecs(
 					testingpytorchjob.PyTorchReplicaSpecRequirement{
@@ -491,6 +752,101 @@ var _ = ginkgo.Describe("MultiKueue", func() {
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 			})
 		})
+
+		ginkgo.It("Should run a RayJob on worker if admitted", func() {
+			kuberayTestImage := getKuberayTestImage()
+			// Since it requires 1.5 CPU, this job can only be admitted in worker 1.
+			rayjob := testingrayjob.MakeJob("rayjob1", managerNs.Name).
+				Suspend(true).
+				Queue(managerLq.Name).
+				WithSubmissionMode(rayv1.K8sJobMode).
+				Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
+				Request(rayv1.WorkerNode, corev1.ResourceCPU, "0.5").
+				Entrypoint("python -c \"import ray; ray.init(); print(ray.cluster_resources())\"").
+				Image(rayv1.HeadNode, kuberayTestImage, []string{}).
+				Image(rayv1.WorkerNode, kuberayTestImage, []string{}).
+				Obj()
+
+			ginkgo.By("Creating the RayJob", func() {
+				gomega.Expect(k8sManagerClient.Create(ctx, rayjob)).Should(gomega.Succeed())
+			})
+
+			wlLookupKey := types.NamespacedName{Name: workloadrayjob.GetWorkloadNameForRayJob(rayjob.Name, rayjob.UID), Namespace: managerNs.Name}
+			// the execution should be given to the worker1
+			waitForJobAdmitted(wlLookupKey, multiKueueAc.Name, "worker1")
+
+			ginkgo.By("Waiting for the RayJob to finish", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdRayJob := &rayv1.RayJob{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(rayjob), createdRayJob)).To(gomega.Succeed())
+					g.Expect(createdRayJob.Status.JobDeploymentStatus).To(gomega.Equal(rayv1.JobDeploymentStatusComplete))
+					finishReasonMessage := "Job finished successfully."
+					checkFinishStatusCondition(g, wlLookupKey, finishReasonMessage)
+				}, 5*util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Checking no objects are left in the worker clusters and the RayJob is completed", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					workerWl := &kueue.Workload{}
+					g.Expect(k8sWorker1Client.Get(ctx, wlLookupKey, workerWl)).To(utiltesting.BeNotFoundError())
+					g.Expect(k8sWorker2Client.Get(ctx, wlLookupKey, workerWl)).To(utiltesting.BeNotFoundError())
+					workerRayJob := &rayv1.RayJob{}
+					g.Expect(k8sWorker1Client.Get(ctx, client.ObjectKeyFromObject(rayjob), workerRayJob)).To(utiltesting.BeNotFoundError())
+					g.Expect(k8sWorker2Client.Get(ctx, client.ObjectKeyFromObject(rayjob), workerRayJob)).To(utiltesting.BeNotFoundError())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+		})
+
+		ginkgo.It("Should run a RayCluster on worker if admitted", func() {
+			kuberayTestImage := getKuberayTestImage()
+			// Since it requires 1.5 CPU, this job can only be admitted in worker 1.
+			raycluster := testingraycluster.MakeCluster("raycluster1", managerNs.Name).
+				Suspend(true).
+				Queue(managerLq.Name).
+				Request(rayv1.HeadNode, corev1.ResourceCPU, "1").
+				Request(rayv1.WorkerNode, corev1.ResourceCPU, "0.5").
+				Image(rayv1.HeadNode, kuberayTestImage, []string{}).
+				Image(rayv1.WorkerNode, kuberayTestImage, []string{}).
+				Obj()
+
+			ginkgo.By("Creating the RayCluster", func() {
+				gomega.Expect(k8sManagerClient.Create(ctx, raycluster)).Should(gomega.Succeed())
+			})
+
+			wlLookupKey := types.NamespacedName{Name: workloadraycluster.GetWorkloadNameForRayCluster(raycluster.Name, raycluster.UID), Namespace: managerNs.Name}
+			// the execution should be given to the worker1
+			waitForJobAdmitted(wlLookupKey, multiKueueAc.Name, "worker1")
+
+			ginkgo.By("Checking the RayCluster is ready", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdRayCluster := &rayv1.RayCluster{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(raycluster), createdRayCluster)).To(gomega.Succeed())
+					g.Expect(createdRayCluster.Status.DesiredWorkerReplicas).To(gomega.Equal(int32(1)))
+					g.Expect(createdRayCluster.Status.ReadyWorkerReplicas).To(gomega.Equal(int32(1)))
+					g.Expect(createdRayCluster.Status.AvailableWorkerReplicas).To(gomega.Equal(int32(1)))
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Setting the RayCluster to suspended", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					updatedCluster := &rayv1.RayCluster{}
+					g.Expect(k8sWorker1Client.Get(ctx, client.ObjectKeyFromObject(raycluster), updatedCluster)).To(gomega.Succeed())
+					updatedCluster.Spec.Suspend = ptr.To(true)
+					g.Expect(k8sWorker1Client.Update(ctx, updatedCluster)).To(gomega.Succeed())
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
+			})
+
+			ginkgo.By("Checking the RayCluster got suspended", func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					createdRayCluster := &rayv1.RayCluster{}
+					g.Expect(k8sManagerClient.Get(ctx, client.ObjectKeyFromObject(raycluster), createdRayCluster)).To(gomega.Succeed())
+					// Suspended RayCluster manifests with removed pods
+					g.Expect(createdRayCluster.Status.DesiredWorkerReplicas).To(gomega.Equal(int32(1)))
+					g.Expect(createdRayCluster.Status.ReadyWorkerReplicas).To(gomega.Equal(int32(0)))
+					g.Expect(createdRayCluster.Status.AvailableWorkerReplicas).To(gomega.Equal(int32(0)))
+				}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
+			})
+		})
 	})
 	ginkgo.When("The connection to a worker cluster is unreliable", func() {
 		ginkgo.It("Should update the cluster status to reflect the connection state", func() {
@@ -571,23 +927,22 @@ var _ = ginkgo.Describe("MultiKueue", func() {
 })
 
 func waitForJobAdmitted(wlLookupKey types.NamespacedName, acName, workerName string) {
-	ginkgo.By(fmt.Sprintf("Waiting to be admitted in %s and manager", workerName), func() {
-		gomega.Eventually(func(g gomega.Gomega) {
-			createdWorkload := &kueue.Workload{}
-			g.Expect(k8sManagerClient.Get(ctx, wlLookupKey, createdWorkload)).To(gomega.Succeed())
-			g.Expect(apimeta.FindStatusCondition(createdWorkload.Status.Conditions, kueue.WorkloadAdmitted)).To(gomega.BeComparableTo(&metav1.Condition{
-				Type:    kueue.WorkloadAdmitted,
-				Status:  metav1.ConditionTrue,
-				Reason:  "Admitted",
-				Message: "The workload is admitted",
-			}, util.IgnoreConditionTimestampsAndObservedGeneration))
-			g.Expect(workload.FindAdmissionCheck(createdWorkload.Status.AdmissionChecks, acName)).To(gomega.BeComparableTo(&kueue.AdmissionCheckState{
-				Name:    acName,
-				State:   kueue.CheckStateReady,
-				Message: fmt.Sprintf(`The workload got reservation on "%s"`, workerName),
-			}, cmpopts.IgnoreFields(kueue.AdmissionCheckState{}, "LastTransitionTime")))
-		}, util.Timeout, util.Interval).Should(gomega.Succeed())
-	})
+	ginkgo.By(fmt.Sprintf("Waiting to be admitted in %s and manager", workerName))
+	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+		createdWorkload := &kueue.Workload{}
+		g.Expect(k8sManagerClient.Get(ctx, wlLookupKey, createdWorkload)).To(gomega.Succeed())
+		g.Expect(apimeta.FindStatusCondition(createdWorkload.Status.Conditions, kueue.WorkloadAdmitted)).To(gomega.BeComparableTo(&metav1.Condition{
+			Type:    kueue.WorkloadAdmitted,
+			Status:  metav1.ConditionTrue,
+			Reason:  "Admitted",
+			Message: "The workload is admitted",
+		}, util.IgnoreConditionTimestampsAndObservedGeneration))
+		g.Expect(workload.FindAdmissionCheck(createdWorkload.Status.AdmissionChecks, acName)).To(gomega.BeComparableTo(&kueue.AdmissionCheckState{
+			Name:    acName,
+			State:   kueue.CheckStateReady,
+			Message: fmt.Sprintf(`The workload got reservation on "%s"`, workerName),
+		}, cmpopts.IgnoreFields(kueue.AdmissionCheckState{}, "LastTransitionTime")))
+	}, util.LongTimeout, util.Interval).Should(gomega.Succeed())
 }
 
 func checkFinishStatusCondition(g gomega.Gomega, wlLookupKey types.NamespacedName, finishReasonMessage string) {
@@ -599,4 +954,54 @@ func checkFinishStatusCondition(g gomega.Gomega, wlLookupKey types.NamespacedNam
 		Reason:  kueue.WorkloadFinishedReasonSucceeded,
 		Message: finishReasonMessage,
 	}, util.IgnoreConditionTimestampsAndObservedGeneration))
+}
+
+func getKuberayTestImage() string {
+	var (
+		kuberayTestImage string
+		found            bool
+	)
+	if runtime.GOARCH == "arm64" {
+		kuberayTestImage, found = os.LookupEnv("KUBERAY_RAY_IMAGE_ARM")
+	} else {
+		kuberayTestImage, found = os.LookupEnv("KUBERAY_RAY_IMAGE")
+	}
+	gomega.Expect(found).To(gomega.BeTrue())
+	return kuberayTestImage
+}
+
+func ensurePodWorkloadsRunning(deployment *appsv1.Deployment, managerNs corev1.Namespace, multiKueueAc *kueue.AdmissionCheck, kubernetesClients map[string]client.Client) {
+	// Given the unpredictable nature of where the deployment pods run this function gathers the workload of a Pod first
+	// it then gets the Pod's assigned cluster from the admission check message and uses the appropriate client to ensure the Pod is running
+	pods := &corev1.PodList{}
+	gomega.Expect(k8sManagerClient.List(ctx, pods, client.InNamespace(managerNs.Namespace),
+		client.MatchingLabels(deployment.Spec.Selector.MatchLabels))).To(gomega.Succeed())
+
+	for _, pod := range pods.Items { // We want to test that all deployment pods have workloads.
+		createdLeaderWorkload := &kueue.Workload{}
+		wlLookupKey := types.NamespacedName{Name: workloadpod.GetWorkloadNameForPod(pod.Name, pod.UID), Namespace: managerNs.Name}
+		gomega.Expect(k8sManagerClient.Get(ctx, wlLookupKey, createdLeaderWorkload)).To(gomega.Succeed())
+
+		// By checking the assigned cluster we can discern which client to use
+		admissionCheckMessage := workload.FindAdmissionCheck(createdLeaderWorkload.Status.AdmissionChecks, multiKueueAc.Name).Message
+		workerCluster := kubernetesClients[GetMultiKueueClusterNameFromAdmissionCheckMessage(admissionCheckMessage)]
+
+		// Worker pods should be in "Running" phase
+		gomega.Eventually(func(g gomega.Gomega) {
+			createdPod := &corev1.Pod{}
+			g.Expect(workerCluster.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, createdPod)).To(gomega.Succeed())
+			g.Expect(createdPod.Status.Phase).Should(gomega.Equal(corev1.PodRunning))
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	}
+}
+
+func GetMultiKueueClusterNameFromAdmissionCheckMessage(message string) string {
+	regex := regexp.MustCompile(`"([^"]*)"`)
+	// Find the match
+	match := regex.FindStringSubmatch(message)
+	if len(match) > 1 {
+		workerName := match[1]
+		return workerName
+	}
+	return ""
 }

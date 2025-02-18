@@ -93,7 +93,7 @@ func (r *topologyUngater) setupWithManager(mgr ctrl.Manager, cfg *configapi.Conf
 		expectationsStore: r.expectationsStore,
 	}
 	return TASTopologyUngater, ctrl.NewControllerManagedBy(mgr).
-		Named(TASTopologyUngater).
+		Named("tas_topology_ungater").
 		For(&kueue.Workload{}).
 		Watches(&corev1.Pod{}, &podHandler).
 		WithOptions(controller.Options{NeedLeaderElection: ptr.To(false)}).
@@ -264,7 +264,7 @@ func (r *topologyUngater) podsForPodSet(ctx context.Context, ns, wlName, psName 
 	}
 	result := make([]*corev1.Pod, 0, len(pods.Items))
 	for i := range pods.Items {
-		if phase := pods.Items[i].Status.Phase; phase == corev1.PodFailed || phase == corev1.PodSucceeded {
+		if utilpod.IsTerminated(&pods.Items[i]) {
 			// ignore failed or succeeded pods as they need to be replaced, and
 			// so we don't want to count them as already ungated Pods.
 			continue

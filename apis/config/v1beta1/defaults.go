@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	configv1alpha1 "k8s.io/component-base/config/v1alpha1"
@@ -33,7 +34,7 @@ const (
 	DefaultWebhookSecretName                            = "kueue-webhook-server-cert"
 	DefaultWebhookPort                                  = 9443
 	DefaultHealthProbeBindAddress                       = ":8081"
-	DefaultMetricsBindAddress                           = ":8080"
+	DefaultMetricsBindAddress                           = ":8443"
 	DefaultLeaderElectionID                             = "c1f6bfd2.kueue.x-k8s.io"
 	DefaultLeaderElectionLeaseDuration                  = 15 * time.Second
 	DefaultLeaderElectionRenewDeadline                  = 10 * time.Second
@@ -167,7 +168,7 @@ func SetDefaults_Configuration(cfg *Configuration) {
 		cfg.Integrations.PodOptions.NamespaceSelector = &metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				{
-					Key:      "kubernetes.io/metadata.name",
+					Key:      corev1.LabelMetadataName,
 					Operator: metav1.LabelSelectorOpNotIn,
 					Values:   matchExpressionsValues,
 				},
@@ -185,7 +186,7 @@ func SetDefaults_Configuration(cfg *Configuration) {
 		cfg.ManagedJobsNamespaceSelector = &metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				{
-					Key:      "kubernetes.io/metadata.name",
+					Key:      corev1.LabelMetadataName,
 					Operator: metav1.LabelSelectorOpNotIn,
 					Values:   matchExpressionsValues,
 				},

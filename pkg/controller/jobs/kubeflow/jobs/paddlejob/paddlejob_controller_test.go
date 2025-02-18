@@ -306,7 +306,10 @@ func TestPodSets(t *testing.T) {
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			gotPodSets := fromObject(tc.job).PodSets()
+			gotPodSets, err := fromObject(tc.job).PodSets()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if diff := cmp.Diff(tc.wantPodSets(tc.job), gotPodSets); diff != "" {
 				t.Errorf("pod sets mismatch (-want +got):\n%s", diff)
 			}
@@ -413,7 +416,7 @@ func TestReconciler(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "ns",
 			Labels: map[string]string{
-				"kubernetes.io/metadata.name": "ns",
+				corev1.LabelMetadataName: "ns",
 			},
 		},
 	}

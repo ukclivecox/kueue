@@ -23,7 +23,10 @@ import (
 
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	rayutils "github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -39,8 +42,9 @@ var (
 )
 
 const (
-	headGroupPodSetName = "head"
-	FrameworkName       = "ray.io/rayjob"
+	headGroupPodSetName    = "head"
+	submitterJobPodSetName = "submitter"
+	FrameworkName          = "ray.io/rayjob"
 )
 
 func init() {
@@ -52,12 +56,13 @@ func init() {
 		JobType:                &rayv1.RayJob{},
 		AddToScheme:            rayv1.AddToScheme,
 		IsManagingObjectsOwner: isRayJob,
+		MultiKueueAdapter:      &multiKueueAdapter{},
 	}))
 }
 
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;watch;update
 // +kubebuilder:rbac:groups=ray.io,resources=rayjobs,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=ray.io,resources=rayjobs/status,verbs=get;update
+// +kubebuilder:rbac:groups=ray.io,resources=rayjobs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ray.io,resources=rayjobs/finalizers,verbs=get;update
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads/status,verbs=get;update;patch
@@ -79,12 +84,17 @@ func (j *RayJob) Object() client.Object {
 	return (*rayv1.RayJob)(j)
 }
 
+func fromObject(obj runtime.Object) *RayJob {
+	return (*RayJob)(obj.(*rayv1.RayJob))
+}
+
 func (j *RayJob) IsSuspended() bool {
 	return j.Spec.Suspend
 }
 
 func (j *RayJob) IsActive() bool {
-	return j.Status.JobDeploymentStatus != rayv1.JobDeploymentStatusSuspended
+	// When the status is Suspended or New there should be no running Pods, and so the Job is not active.
+	return !(j.Status.JobDeploymentStatus == rayv1.JobDeploymentStatusSuspended || j.Status.JobDeploymentStatus == rayv1.JobDeploymentStatusNew)
 }
 
 func (j *RayJob) Suspend() {
@@ -102,17 +112,16 @@ func (j *RayJob) PodLabelSelector() string {
 	return ""
 }
 
-func (j *RayJob) PodSets() []kueue.PodSet {
-	// len = workerGroups + head
-	podSets := make([]kueue.PodSet, len(j.Spec.RayClusterSpec.WorkerGroupSpecs)+1)
+func (j *RayJob) PodSets() ([]kueue.PodSet, error) {
+	podSets := make([]kueue.PodSet, 0)
 
 	// head
-	podSets[0] = kueue.PodSet{
+	podSets = append(podSets, kueue.PodSet{
 		Name:            headGroupPodSetName,
 		Template:        *j.Spec.RayClusterSpec.HeadGroupSpec.Template.DeepCopy(),
 		Count:           1,
 		TopologyRequest: jobframework.PodSetTopologyRequest(&j.Spec.RayClusterSpec.HeadGroupSpec.Template.ObjectMeta, nil, nil, nil),
-	}
+	})
 
 	// workers
 	for index := range j.Spec.RayClusterSpec.WorkerGroupSpecs {
@@ -124,18 +133,34 @@ func (j *RayJob) PodSets() []kueue.PodSet {
 		if wgs.NumOfHosts > 1 {
 			count *= wgs.NumOfHosts
 		}
-		podSets[index+1] = kueue.PodSet{
+		podSets = append(podSets, kueue.PodSet{
 			Name:            strings.ToLower(wgs.GroupName),
 			Template:        *wgs.Template.DeepCopy(),
 			Count:           count,
 			TopologyRequest: jobframework.PodSetTopologyRequest(&wgs.Template.ObjectMeta, nil, nil, nil),
-		}
+		})
 	}
-	return podSets
+
+	// submitter Job
+	if j.Spec.SubmissionMode == rayv1.K8sJobMode {
+		submitterJobPodSet := kueue.PodSet{
+			Name:  submitterJobPodSetName,
+			Count: 1,
+		}
+
+		submitterJobPodSet.Template = *getSubmitterTemplate(j)
+		podSets = append(podSets, submitterJobPodSet)
+	}
+
+	return podSets, nil
 }
 
 func (j *RayJob) RunWithPodSetsInfo(podSetsInfo []podset.PodSetInfo) error {
 	expectedLen := len(j.Spec.RayClusterSpec.WorkerGroupSpecs) + 1
+	if j.Spec.SubmissionMode == rayv1.K8sJobMode {
+		expectedLen++
+	}
+
 	if len(podSetsInfo) != expectedLen {
 		return podset.BadPodSetsInfoLenError(expectedLen, len(podSetsInfo))
 	}
@@ -157,11 +182,26 @@ func (j *RayJob) RunWithPodSetsInfo(podSetsInfo []podset.PodSetInfo) error {
 			return err
 		}
 	}
+
+	// submitter
+	if j.Spec.SubmissionMode == rayv1.K8sJobMode {
+		submitterPod := getSubmitterTemplate(j)
+		info := podSetsInfo[expectedLen-1]
+		if err := podset.Merge(&submitterPod.ObjectMeta, &submitterPod.Spec, info); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func (j *RayJob) RestorePodSetsInfo(podSetsInfo []podset.PodSetInfo) bool {
-	if len(podSetsInfo) != len(j.Spec.RayClusterSpec.WorkerGroupSpecs)+1 {
+	expectedLen := len(j.Spec.RayClusterSpec.WorkerGroupSpecs) + 1
+	if j.Spec.SubmissionMode == rayv1.K8sJobMode {
+		expectedLen++
+	}
+
+	if len(podSetsInfo) != expectedLen {
 		return false
 	}
 
@@ -175,6 +215,14 @@ func (j *RayJob) RestorePodSetsInfo(podSetsInfo []podset.PodSetInfo) bool {
 		info := podSetsInfo[index+1]
 		changed = podset.RestorePodSpec(&workerPod.ObjectMeta, &workerPod.Spec, info) || changed
 	}
+
+	// submitter
+	if j.Spec.SubmissionMode == rayv1.K8sJobMode {
+		submitterPod := getSubmitterTemplate(j)
+		info := podSetsInfo[expectedLen-1]
+		changed = podset.RestorePodSpec(&submitterPod.ObjectMeta, &submitterPod.Spec, info) || changed
+	}
+
 	return changed
 }
 
@@ -199,4 +247,36 @@ func GetWorkloadNameForRayJob(jobName string, jobUID types.UID) string {
 
 func isRayJob(owner *metav1.OwnerReference) bool {
 	return owner.Kind == "RayJob" && strings.HasPrefix(owner.APIVersion, "ray.io/v1")
+}
+
+// getSubmitterTemplate returns the PodTemplteSpec of the submitter Job used for RayJob when submissionMode=K8sJobMode
+func getSubmitterTemplate(rayJob *RayJob) *corev1.PodTemplateSpec {
+	if rayJob.Spec.SubmitterPodTemplate != nil {
+		return rayJob.Spec.SubmitterPodTemplate
+	}
+
+	// The default submitter Job pod template is copied from
+	// https://github.com/ray-project/kuberay/blob/86506d6b88a6428fc66048c276d7d93b39df7489/ray-operator/controllers/ray/common/job.go#L122-L146
+	return &corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name: "ray-job-submitter",
+					// Use the image of the Ray head to be defensive against version mismatch issues
+					Image: rayJob.Spec.RayClusterSpec.HeadGroupSpec.Template.Spec.Containers[0].Image,
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("1"),
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("500m"),
+							corev1.ResourceMemory: resource.MustParse("200Mi"),
+						},
+					},
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
 }

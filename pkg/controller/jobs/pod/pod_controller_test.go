@@ -182,7 +182,11 @@ func TestPodSets(t *testing.T) {
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			if diff := cmp.Diff(tc.wantPodSets(tc.pod), tc.pod.PodSets()); diff != "" {
+			gotPodSets, err := tc.pod.PodSets()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.wantPodSets(tc.pod), gotPodSets); diff != "" {
 				t.Errorf("pod sets mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -246,7 +250,7 @@ func TestReconciler(t *testing.T) {
 	}{
 		"scheduling gate is removed and node selector is added if workload is admitted": {
 			initObjects: []client.Object{
-				utiltesting.MakeResourceFlavor("unit-test-flavor").NodeLabel("kubernetes.io/arch", "arm64").Obj(),
+				utiltesting.MakeResourceFlavor("unit-test-flavor").NodeLabel(corev1.LabelArchStable, "arm64").Obj(),
 			},
 			pods: []corev1.Pod{*basePodWrapper.
 				Clone().
@@ -257,7 +261,7 @@ func TestReconciler(t *testing.T) {
 			wantPods: []corev1.Pod{*basePodWrapper.
 				Clone().
 				Label(constants.ManagedByKueueLabel, "true").
-				NodeSelector("kubernetes.io/arch", "arm64").
+				NodeSelector(corev1.LabelArchStable, "arm64").
 				KueueFinalizer().
 				Obj()},
 			workloads: []kueue.Workload{
@@ -980,7 +984,7 @@ func TestReconciler(t *testing.T) {
 		},
 		"scheduling gate is removed for all pods in the group if workload is admitted": {
 			initObjects: []client.Object{
-				utiltesting.MakeResourceFlavor("unit-test-flavor").NodeLabel("kubernetes.io/arch", "arm64").Obj(),
+				utiltesting.MakeResourceFlavor("unit-test-flavor").NodeLabel(corev1.LabelArchStable, "arm64").Obj(),
 			},
 			pods: []corev1.Pod{
 				*basePodWrapper.
@@ -1008,7 +1012,7 @@ func TestReconciler(t *testing.T) {
 					KueueFinalizer().
 					Group("test-group").
 					GroupTotalCount("2").
-					NodeSelector("kubernetes.io/arch", "arm64").
+					NodeSelector(corev1.LabelArchStable, "arm64").
 					Obj(),
 				*basePodWrapper.
 					Clone().
@@ -1017,7 +1021,7 @@ func TestReconciler(t *testing.T) {
 					KueueFinalizer().
 					Group("test-group").
 					GroupTotalCount("2").
-					NodeSelector("kubernetes.io/arch", "arm64").
+					NodeSelector(corev1.LabelArchStable, "arm64").
 					Obj(),
 			},
 			workloads: []kueue.Workload{
@@ -5109,6 +5113,295 @@ func TestReconciler(t *testing.T) {
 					Obj(),
 			},
 		},
+		"when the prebuilt workload exists its owner info is updated": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Name("pod1").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("prebuilt-workload", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet("dc85db45", 2).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Name("pod1").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusConditions(corev1.PodCondition{
+						Type:    ConditionTypeTerminationTarget,
+						Status:  corev1.ConditionTrue,
+						Reason:  "NotAdmitted",
+						Message: "Not admitted by cluster queue",
+					}).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusConditions(corev1.PodCondition{
+						Type:    ConditionTypeTerminationTarget,
+						Status:  corev1.ConditionTrue,
+						Reason:  "NotAdmitted",
+						Message: "Not admitted by cluster queue",
+					}).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("prebuilt-workload", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet("dc85db45", 2).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod1", "test-uid").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod2", "test-uid").
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				{
+					Key:       types.NamespacedName{Name: "prebuilt-workload", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "OwnerReferencesAdded",
+					Message:   "Added 2 owner reference(s)",
+				},
+				{
+					Key:       types.NamespacedName{Name: "pod1", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "Stopped",
+					Message:   "Not admitted by cluster queue",
+				},
+				{
+					Key:       types.NamespacedName{Name: "pod2", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "Stopped",
+					Message:   "Not admitted by cluster queue",
+				},
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"when the prebuilt workload is partially owned": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Name("pod1").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("prebuilt-workload", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet("dc85db45", 2).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod1", "test-uid").
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Name("pod1").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusConditions(corev1.PodCondition{
+						Type:    ConditionTypeTerminationTarget,
+						Status:  corev1.ConditionTrue,
+						Reason:  "NotAdmitted",
+						Message: "Not admitted by cluster queue",
+					}).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusConditions(corev1.PodCondition{
+						Type:    ConditionTypeTerminationTarget,
+						Status:  corev1.ConditionTrue,
+						Reason:  "NotAdmitted",
+						Message: "Not admitted by cluster queue",
+					}).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("prebuilt-workload", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet("dc85db45", 2).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod1", "test-uid").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod2", "test-uid").
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				{
+					Key:       types.NamespacedName{Name: "prebuilt-workload", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "OwnerReferencesAdded",
+					Message:   "Added 1 owner reference(s)",
+				},
+				{
+					Key:       types.NamespacedName{Name: "pod1", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "Stopped",
+					Message:   "Not admitted by cluster queue",
+				},
+				{
+					Key:       types.NamespacedName{Name: "pod2", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "Stopped",
+					Message:   "Not admitted by cluster queue",
+				},
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"when the prebuilt workload is not equivalent to the job": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Name("pod1").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("prebuilt-workload", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod1", "test-uid").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod2", "test-uid").
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Name("pod1").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusConditions(corev1.PodCondition{
+						Type:    ConditionTypeTerminationTarget,
+						Status:  corev1.ConditionTrue,
+						Reason:  "NoMatchingWorkload",
+						Message: "missing workload",
+					}).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label(constants.ManagedByKueueLabel, "true").
+					Label(controllerconsts.PrebuiltWorkloadLabel, "prebuilt-workload").
+					KueueFinalizer().
+					StatusPhase(corev1.PodPending).
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusConditions(corev1.PodCondition{
+						Type:    ConditionTypeTerminationTarget,
+						Status:  corev1.ConditionTrue,
+						Reason:  "NoMatchingWorkload",
+						Message: "missing workload",
+					}).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("prebuilt-workload", "ns").
+					Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 2).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod1", "test-uid").
+					OwnerReference(corev1.SchemeGroupVersion.WithKind("Pod"), "pod2", "test-uid").
+					Condition(metav1.Condition{
+						Type:    kueue.WorkloadFinished,
+						Status:  metav1.ConditionTrue,
+						Reason:  "OutOfSync",
+						Message: "The prebuilt workload is out of sync with its user job",
+					}).
+					Obj(),
+			},
+			wantEvents: []utiltesting.EventRecord{
+				{
+					Key:       types.NamespacedName{Name: "pod1", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "Stopped",
+					Message:   "missing workload",
+				},
+				{
+					Key:       types.NamespacedName{Name: "pod2", Namespace: "ns"},
+					EventType: "Normal",
+					Reason:    "Stopped",
+					Message:   "missing workload",
+				},
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+			wantErr:         jobframework.ErrPrebuildWorkloadNotFound,
+		},
 	}
 
 	for name, tc := range testCases {
@@ -5388,6 +5681,7 @@ func TestGetWorkloadNameForPod(t *testing.T) {
 
 func TestReconciler_DeletePodAfterTransientErrorsOnUpdateOrDeleteOps(t *testing.T) {
 	now := time.Now()
+	fakeClock := testingclock.NewFakeClock(now)
 	connRefusedErrMock := fmt.Errorf("connection refused: %w", syscall.ECONNREFUSED)
 	ctx, _ := utiltesting.ContextWithLog(t)
 	var triggerUpdateErr, triggerDeleteErr bool
@@ -5475,7 +5769,7 @@ func TestReconciler_DeletePodAfterTransientErrorsOnUpdateOrDeleteOps(t *testing.
 	}
 
 	recorder := record.NewBroadcaster().NewRecorder(kClient.Scheme(), corev1.EventSource{Component: "test"})
-	reconciler := NewReconciler(kClient, recorder)
+	reconciler := NewReconciler(kClient, recorder, jobframework.WithClock(t, fakeClock))
 	reconcileRequest := reconcileRequestForPod(&pods[0])
 
 	// Reconcile for the first time. It'll try  to remove the finalizers but fail

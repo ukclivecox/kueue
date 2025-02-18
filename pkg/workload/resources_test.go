@@ -20,10 +20,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/resources"
+	"sigs.k8s.io/kueue/pkg/util/limitrange"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 )
 
@@ -477,6 +480,161 @@ func TestAdjustResources(t *testing.T) {
 			AdjustResources(ctx, cl, tc.wl)
 			if diff := cmp.Diff(tc.wl, tc.wantWl); diff != "" {
 				t.Errorf("Unexpected resources after adjusting (-want,+got): %s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateResources(t *testing.T) {
+	cases := map[string]struct {
+		workloadInfo *Info
+		wantError    field.ErrorList
+	}{
+		"valid workload": {
+			workloadInfo: &Info{
+				Obj: utiltesting.MakeWorkload("alpha", metav1.NamespaceDefault).
+					PodSets(
+						*utiltesting.MakePodSet("a", 1).
+							Containers(
+								*utiltesting.MakeContainer().
+									WithResourceReq(corev1.ResourceCPU, "100m").
+									WithResourceLimit(corev1.ResourceCPU, "200m").
+									WithResourceReq(corev1.ResourceMemory, "100Mi").
+									WithResourceLimit(corev1.ResourceMemory, "200Mi").
+									Obj()).
+							Obj(),
+						*utiltesting.MakePodSet("b", 1).
+							InitContainers(
+								*utiltesting.MakeContainer().
+									WithResourceReq(corev1.ResourceCPU, "100m").
+									WithResourceLimit(corev1.ResourceCPU, "200m").
+									Obj()).
+							Obj(),
+					).Obj(),
+			},
+		},
+		"invalid workload; multiple PodSet has invalid initContainers and containers": {
+			workloadInfo: &Info{
+				Obj: utiltesting.MakeWorkload("alpha", metav1.NamespaceDefault).PodSets(
+					*utiltesting.MakePodSet("a", 1).
+						InitContainers(
+							*utiltesting.MakeContainer().
+								WithResourceReq(corev1.ResourceMemory, "200Mi").
+								WithResourceLimit(corev1.ResourceMemory, "100Mi").
+								WithResourceReq(corev1.ResourceCPU, "100m").
+								WithResourceLimit(corev1.ResourceCPU, "200m").
+								Obj()).
+						Containers(
+							*utiltesting.MakeContainer().
+								WithResourceReq(corev1.ResourceCPU, "300m").
+								WithResourceLimit(corev1.ResourceCPU, "200m").
+								Obj()).
+						Obj(),
+					*utiltesting.MakePodSet("b", 1).
+						InitContainers(
+							*utiltesting.MakeContainer().
+								WithResourceReq(corev1.ResourceCPU, "300m").
+								WithResourceLimit(corev1.ResourceCPU, "200m").
+								Obj()).
+						Containers(
+							*utiltesting.MakeContainer().
+								WithResourceReq(corev1.ResourceCPU, "100m").
+								WithResourceLimit(corev1.ResourceCPU, "200m").
+								Obj()).
+						Obj(),
+				).Obj(),
+			},
+			wantError: field.ErrorList{
+				field.Invalid(PodSetsPath.Index(0).Child("template").Child("spec").Child("initContainers").Index(0),
+					[]string{corev1.ResourceMemory.String()}, RequestsMustNotExceedLimitMessage),
+				field.Invalid(PodSetsPath.Index(0).Child("template").Child("spec").Child("containers").Index(0),
+					[]string{corev1.ResourceCPU.String()}, RequestsMustNotExceedLimitMessage),
+				field.Invalid(PodSetsPath.Index(1).Child("template").Child("spec").Child("initContainers").Index(0),
+					[]string{corev1.ResourceCPU.String()}, RequestsMustNotExceedLimitMessage),
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := ValidateResources(tc.workloadInfo)
+			if diff := cmp.Diff(tc.wantError, got); len(diff) != 0 {
+				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateLimitRange(t *testing.T) {
+	cases := map[string]struct {
+		limitRange *corev1.LimitRange
+		workload   *kueue.Workload
+		wantError  field.ErrorList
+	}{
+		"valid case with LimitRange": {
+			limitRange: utiltesting.MakeLimitRange("test", metav1.NamespaceDefault).
+				WithType(corev1.LimitTypePod).
+				WithValue("Max", corev1.ResourceCPU, "1000m").
+				Obj(),
+			workload: utiltesting.MakeWorkload("", metav1.NamespaceDefault).
+				PodSets(
+					*utiltesting.MakePodSet("alpha", 1).
+						Request(corev1.ResourceCPU, "300m").
+						Obj(),
+					*utiltesting.MakePodSet("beta", 1).
+						Request(corev1.ResourceCPU, "200m").
+						Obj(),
+				).
+				Obj(),
+		},
+		"valid case without LimitRange": {
+			workload: utiltesting.MakeWorkload("test", metav1.NamespaceDefault).
+				PodSets(
+					*utiltesting.MakePodSet("alpha", 1).
+						Request(corev1.ResourceCPU, "300m").
+						Obj(),
+					*utiltesting.MakePodSet("beta", 1).
+						Request(corev1.ResourceCPU, "200m").
+						Obj(),
+				).
+				Obj(),
+		},
+		"pod doesn't satisfy LimitRange constraints": {
+			limitRange: utiltesting.MakeLimitRange("test", metav1.NamespaceDefault).
+				WithType(corev1.LimitTypePod).
+				WithValue("Max", corev1.ResourceCPU, "500m").
+				Obj(),
+			workload: utiltesting.MakeWorkload("test", metav1.NamespaceDefault).
+				PodSets(
+					*utiltesting.MakePodSet("alpha", 1).
+						Request(corev1.ResourceCPU, "300m").
+						InitContainers(
+							*utiltesting.MakeContainer().
+								AsSidecar().
+								WithResourceReq(corev1.ResourceCPU, "300m").
+								Obj(),
+						).
+						Obj(),
+				).
+				Obj(),
+			wantError: field.ErrorList{
+				field.Invalid(
+					PodSetsPath.Index(0).Child("template").Child("spec"),
+					[]string{corev1.ResourceCPU.String()},
+					limitrange.RequestsMustNotBeAboveLimitRangeMaxMessage,
+				),
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx, _ := utiltesting.ContextWithLog(t)
+			cliBuilder := utiltesting.NewClientBuilder()
+			if tc.limitRange != nil {
+				cliBuilder.WithObjects(tc.limitRange)
+			}
+			got := ValidateLimitRange(ctx, cliBuilder.Build(), &Info{Obj: tc.workload})
+			if diff := cmp.Diff(tc.wantError, got); len(diff) != 0 {
+				t.Errorf("Unexpected error (-want,+got):\n%s", diff)
 			}
 		})
 	}

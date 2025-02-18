@@ -49,6 +49,12 @@ func (r Requests) Divide(f int64) {
 	}
 }
 
+func (r Requests) Mul(f int64) {
+	for k := range r {
+		r[k] *= f
+	}
+}
+
 func (r Requests) Add(addRequests Requests) {
 	for k, v := range addRequests {
 		r[k] += v
@@ -104,6 +110,7 @@ func (req Requests) CountIn(capacity Requests) int32 {
 		if !found {
 			return 0
 		}
+		// find the minimum count matching all the resource quota.
 		count := int32(capacity / rValue)
 		if result == nil || count < *result {
 			result = ptr.To(count)

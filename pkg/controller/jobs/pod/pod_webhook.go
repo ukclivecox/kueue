@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +37,7 @@ import (
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta1"
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 	"sigs.k8s.io/kueue/pkg/constants"
+	ctrlconstants "sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework/webhook"
 	"sigs.k8s.io/kueue/pkg/features"
@@ -51,6 +53,7 @@ const (
 	GroupTotalCountAnnotation    = "kueue.x-k8s.io/pod-group-total-count"
 	GroupFastAdmissionAnnotation = "kueue.x-k8s.io/pod-group-fast-admission"
 	GroupServingAnnotation       = "kueue.x-k8s.io/pod-group-serving"
+	SuspendedByParentAnnotation  = "kueue.x-k8s.io/pod-suspending-parent"
 	RoleHashAnnotation           = "kueue.x-k8s.io/role-hash"
 	RetriableInGroupAnnotation   = "kueue.x-k8s.io/retriable-in-group"
 )
@@ -116,19 +119,6 @@ func getPodOptions(integrationOpts map[string]any) (*configapi.PodIntegrationOpt
 
 var _ admission.CustomDefaulter = &PodWebhook{}
 
-func containersShape(containers []corev1.Container) (result []map[string]interface{}) {
-	for _, c := range containers {
-		result = append(result, map[string]interface{}{
-			"resources": map[string]interface{}{
-				"requests": c.Resources.Requests,
-			},
-			"ports": c.Ports,
-		})
-	}
-
-	return result
-}
-
 // addRoleHash calculates the role hash and adds it to the pod's annotations
 func (p *Pod) addRoleHash() error {
 	if p.pod.Annotations == nil {
@@ -149,26 +139,19 @@ func (w *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 	log := ctrl.LoggerFrom(ctx).WithName("pod-webhook")
 	log.V(5).Info("Applying defaults")
 
-	ns := corev1.Namespace{}
-	err := w.client.Get(ctx, client.ObjectKey{Name: pod.pod.GetNamespace()}, &ns)
-	if err != nil {
-		return fmt.Errorf("failed to run mutating webhook on pod %s, error while getting namespace: %w",
-			pod.pod.GetName(),
-			err,
-		)
-	}
-	log.V(5).Info("Found pod namespace", "Namespace.Name", ns.GetName())
-	jobframework.ApplyDefaultLocalQueue(pod.Object(), w.queues.DefaultLocalQueueExist)
-	suspend, err := jobframework.WorkloadShouldBeSuspended(ctx, pod.Object(), w.client, w.manageJobsWithoutQueueName, w.managedJobsNamespaceSelector)
-	if err != nil {
-		return err
-	}
+	_, suspend := pod.pod.GetAnnotations()[SuspendedByParentAnnotation]
+	if !suspend {
+		// Namespace filtering
+		ns := corev1.Namespace{}
+		err := w.client.Get(ctx, client.ObjectKey{Name: pod.pod.GetNamespace()}, &ns)
+		if err != nil {
+			return fmt.Errorf("failed to get namespace: %w", err)
+		}
+		if features.Enabled(features.ManagedJobsNamespaceSelector) && !w.managedJobsNamespaceSelector.Matches(labels.Set(ns.GetLabels())) {
+			return nil
+		}
 
-	// Backwards compatibility support until podOptions.podSelector and podOptions.namespaceSelector are deprecated.
-	// When WorkloadShouldBeSuspend determines that suspend is true, also run the podOptions based checks
-	// and if either of them exempts the Pod from suspension, we return early.
-	if suspend {
-		// podOptions.podSelector
+		// Backwards compatibility: podOptions.podSelector
 		podSelector, err := metav1.LabelSelectorAsSelector(w.podSelector)
 		if err != nil {
 			return fmt.Errorf("failed to parse pod selector: %w", err)
@@ -177,7 +160,7 @@ func (w *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 			return nil
 		}
 
-		// podOptions.namespaceSelector
+		// Backwards compatibility: podOptions.namespaceSelector
 		nsSelector, err := metav1.LabelSelectorAsSelector(w.namespaceSelector)
 		if err != nil {
 			return fmt.Errorf("failed to parse namespace selector: %w", err)
@@ -185,6 +168,34 @@ func (w *PodWebhook) Default(ctx context.Context, obj runtime.Object) error {
 		if !nsSelector.Matches(labels.Set(ns.GetLabels())) {
 			return nil
 		}
+
+		// Do not suspend a Pod whose owner is already managed by Kueue
+		if owner := metav1.GetControllerOf(pod.Object()); owner != nil {
+			if owner.Kind == "ReplicaSet" && owner.APIVersion == "apps/v1" {
+				// ReplicaSet is an implementation detail; skip over it to the user-facing framework
+				rs := &appsv1.ReplicaSet{}
+				err := w.client.Get(ctx, client.ObjectKey{Name: owner.Name, Namespace: pod.pod.GetNamespace()}, rs)
+				if err != nil {
+					return fmt.Errorf("failed to get replicaset: %w", err)
+				}
+				owner = metav1.GetControllerOf(rs)
+			}
+			if owner != nil && jobframework.IsOwnerIntegrationEnabled(owner) {
+				return nil
+			}
+		}
+
+		// Local queue defaulting
+		if features.Enabled(features.LocalQueueDefaulting) &&
+			jobframework.QueueNameForObject(pod.Object()) == "" &&
+			w.queues.DefaultLocalQueueExist(pod.pod.GetNamespace()) {
+			if pod.pod.Labels == nil {
+				pod.pod.Labels = make(map[string]string)
+			}
+			pod.pod.Labels[ctrlconstants.QueueLabel] = ctrlconstants.DefaultLocalQueueName
+		}
+
+		suspend = jobframework.QueueNameForObject(pod.Object()) != "" || w.manageJobsWithoutQueueName
 	}
 
 	if suspend {
@@ -251,12 +262,16 @@ func (w *PodWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.
 
 	allErrs := jobframework.ValidateJobOnUpdate(oldPod, newPod)
 	allErrs = append(allErrs, validateCommon(newPod)...)
-
-	allErrs = append(allErrs, validation.ValidateImmutableField(podGroupName(newPod.pod), podGroupName(oldPod.pod), groupNameLabelPath)...)
 	allErrs = append(allErrs, validateUpdateForRetriableInGroupAnnotation(oldPod, newPod)...)
 
-	if warn := warningForPodManagedLabel(newPod); warn != "" {
-		warnings = append(warnings, warn)
+	if podGroupName(oldPod.pod) != "" {
+		allErrs = append(allErrs, validation.ValidateImmutableField(podGroupName(newPod.pod), podGroupName(oldPod.pod), groupNameLabelPath)...)
+	}
+
+	if _, suspendByParent := newPod.pod.Annotations[SuspendedByParentAnnotation]; !suspendByParent {
+		if warn := warningForPodManagedLabel(newPod); warn != "" {
+			warnings = append(warnings, warn)
+		}
 	}
 
 	return warnings, allErrs.ToAggregate()

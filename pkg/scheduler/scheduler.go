@@ -21,19 +21,17 @@ import (
 	"fmt"
 	"maps"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
-	"k8s.io/utils/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -47,16 +45,16 @@ import (
 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
 	"sigs.k8s.io/kueue/pkg/util/api"
-	"sigs.k8s.io/kueue/pkg/util/limitrange"
 	"sigs.k8s.io/kueue/pkg/util/priority"
-	"sigs.k8s.io/kueue/pkg/util/resource"
 	"sigs.k8s.io/kueue/pkg/util/routine"
 	"sigs.k8s.io/kueue/pkg/util/wait"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 const (
-	errCouldNotAdmitWL = "Could not admit Workload and assign flavors in apiserver"
+	errCouldNotAdmitWL                           = "Could not admit Workload and assign flavors in apiserver"
+	errInvalidWLResources                        = "resources validation failed"
+	errLimitRangeConstraintsUnsatisfiedResources = "resources didn't satisfy LimitRange constraints"
 )
 
 var (
@@ -74,8 +72,9 @@ type Scheduler struct {
 	fairSharing             config.FairSharing
 	clock                   clock.Clock
 
-	// attemptCount identifies the number of scheduling attempt in logs, from the last restart.
-	attemptCount int64
+	// schedulingCycle identifies the number of scheduling
+	// attempts since the last restart.
+	schedulingCycle int64
 
 	// Stubs.
 	applyAdmission func(context.Context, *kueue.Workload) error
@@ -175,8 +174,8 @@ func reportSkippedPreemptions(p map[string]int) {
 }
 
 func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
-	s.attemptCount++
-	log := ctrl.LoggerFrom(ctx).WithValues("attemptCount", s.attemptCount)
+	s.schedulingCycle++
+	log := ctrl.LoggerFrom(ctx).WithValues("schedulingCycle", s.schedulingCycle)
 	ctx = ctrl.LoggerInto(ctx, log)
 
 	// 1. Get the heads from the queues, including their desired clusterQueue.
@@ -274,7 +273,7 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 			// Block admission until all currently admitted workloads are in
 			// PodsReady condition if the waitForPodsReady is enabled
 			workload.UnsetQuotaReservationWithCondition(e.Obj, "Waiting", "waiting for all admitted workloads to be in PodsReady condition", s.clock.Now())
-			if err := workload.ApplyAdmissionStatus(ctx, s.client, e.Obj, false); err != nil {
+			if err := workload.ApplyAdmissionStatus(ctx, s.client, e.Obj, false, s.clock); err != nil {
 				log.Error(err, "Could not update Workload status")
 			}
 			s.cache.WaitForPodsReady(ctx)
@@ -375,10 +374,10 @@ func (s *Scheduler) nominate(ctx context.Context, workloads []workload.Info, sna
 		} else if !cq.NamespaceSelector.Matches(labels.Set(ns.Labels)) {
 			e.inadmissibleMsg = "Workload namespace doesn't match ClusterQueue selector"
 			e.requeueReason = queue.RequeueReasonNamespaceMismatch
-		} else if err := s.validateResources(&w); err != nil {
-			e.inadmissibleMsg = err.Error()
-		} else if err := s.validateLimitRange(ctx, &w); err != nil {
-			e.inadmissibleMsg = err.Error()
+		} else if err := workload.ValidateResources(&w); err != nil {
+			e.inadmissibleMsg = fmt.Sprintf("%s: %v", errInvalidWLResources, err.ToAggregate())
+		} else if err := workload.ValidateLimitRange(ctx, s.client, &w); err != nil {
+			e.inadmissibleMsg = fmt.Sprintf("%s: %v", errLimitRangeConstraintsUnsatisfiedResources, err.ToAggregate())
 		} else {
 			e.assignment, e.preemptionTargets = s.getAssignments(log, &e.Info, snap)
 			e.inadmissibleMsg = e.assignment.Message()
@@ -461,65 +460,6 @@ func (s *Scheduler) getAssignments(log logr.Logger, wl *workload.Info, snap *cac
 	return fullAssignment, nil
 }
 
-// validateResources validates that requested resources are less or equal
-// to limits.
-func (s *Scheduler) validateResources(wi *workload.Info) error {
-	podsetsPath := field.NewPath("podSets")
-	// requests should be less than limits.
-	allReasons := []string{}
-	for i := range wi.Obj.Spec.PodSets {
-		ps := &wi.Obj.Spec.PodSets[i]
-		psPath := podsetsPath.Child(ps.Name)
-		for i := range ps.Template.Spec.InitContainers {
-			c := ps.Template.Spec.InitContainers[i]
-			if list := resource.GetGreaterKeys(c.Resources.Requests, c.Resources.Limits); len(list) > 0 {
-				allReasons = append(allReasons, fmt.Sprintf("%s[%s] requests exceed it's limits",
-					psPath.Child("initContainers").Index(i).String(),
-					strings.Join(list, ", ")))
-			}
-		}
-
-		for i := range ps.Template.Spec.Containers {
-			c := ps.Template.Spec.Containers[i]
-			if list := resource.GetGreaterKeys(c.Resources.Requests, c.Resources.Limits); len(list) > 0 {
-				allReasons = append(allReasons, fmt.Sprintf("%s[%s] requests exceed it's limits",
-					psPath.Child("containers").Index(i).String(),
-					strings.Join(list, ", ")))
-			}
-		}
-	}
-	if len(allReasons) > 0 {
-		return fmt.Errorf("resource validation failed: %s", strings.Join(allReasons, "; "))
-	}
-	return nil
-}
-
-// validateLimitRange validates that the requested resources fit into the namespace defined
-// limitRanges.
-func (s *Scheduler) validateLimitRange(ctx context.Context, wi *workload.Info) error {
-	podsetsPath := field.NewPath("podSets")
-	// get the range summary from the namespace.
-	list := corev1.LimitRangeList{}
-	if err := s.client.List(ctx, &list, &client.ListOptions{Namespace: wi.Obj.Namespace}); err != nil {
-		return err
-	}
-	if len(list.Items) == 0 {
-		return nil
-	}
-	summary := limitrange.Summarize(list.Items...)
-
-	// verify
-	allReasons := []string{}
-	for i := range wi.Obj.Spec.PodSets {
-		ps := &wi.Obj.Spec.PodSets[i]
-		allReasons = append(allReasons, summary.ValidatePodSpec(&ps.Template.Spec, podsetsPath.Child(ps.Name))...)
-	}
-	if len(allReasons) > 0 {
-		return fmt.Errorf("didn't satisfy LimitRange constraints: %s", strings.Join(allReasons, "; "))
-	}
-	return nil
-}
-
 // admit sets the admitting clusterQueue and flavors into the workload of
 // the entry, and asynchronously updates the object in the apiserver after
 // assuming it in the cache.
@@ -531,7 +471,7 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *cache.ClusterQueueS
 		PodSetAssignments: e.assignment.ToAPI(),
 	}
 
-	workload.SetQuotaReservation(newWorkload, admission)
+	workload.SetQuotaReservation(newWorkload, admission, s.clock)
 	if workload.HasAllChecks(newWorkload, workload.AdmissionChecksForWorkload(log, newWorkload, cq.AdmissionChecks)) {
 		// sync Admitted, ignore the result since an API update is always done.
 		_ = workload.SyncAdmittedCondition(newWorkload, s.clock.Now())
@@ -570,7 +510,7 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *cache.ClusterQueueS
 		// Ignore errors because the workload or clusterQueue could have been deleted
 		// by an event.
 		_ = s.cache.ForgetWorkload(newWorkload)
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			log.V(2).Info("Workload not admitted because it was deleted")
 			return
 		}
@@ -583,7 +523,7 @@ func (s *Scheduler) admit(ctx context.Context, e *entry, cq *cache.ClusterQueueS
 }
 
 func (s *Scheduler) applyAdmissionWithSSA(ctx context.Context, w *kueue.Workload) error {
-	return workload.ApplyAdmissionStatus(ctx, s.client, w, false)
+	return workload.ApplyAdmissionStatus(ctx, s.client, w, false, s.clock)
 }
 
 type entryOrdering struct {
@@ -602,8 +542,9 @@ func (e entryOrdering) Swap(i, j int) {
 
 // Less is the ordering criteria:
 // 1. request under nominal quota before borrowing.
-// 2. higher priority first.
-// 3. FIFO on eviction or creation timestamp.
+// 2. fair sharing: lower DominantResourceShare first.
+// 3. higher priority first.
+// 4. FIFO on eviction or creation timestamp.
 func (e entryOrdering) Less(i, j int) bool {
 	a := e.entries[i]
 	b := e.entries[j]

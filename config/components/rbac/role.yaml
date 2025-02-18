@@ -79,17 +79,9 @@ rules:
   - update
   - watch
 - apiGroups:
-  - admissionregistration.k8s.io
-  resources:
-  - validatingadmissionpolicies
-  - validatingadmissionpolicybindings
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
   - apps
   resources:
+  - replicasets
   - statefulsets
   verbs:
   - get
@@ -175,7 +167,6 @@ rules:
   - kubeflow.org
   resources:
   - mpijobs
-  - mxjobs
   - paddlejobs
   - pytorchjobs
   - tfjobs
@@ -190,8 +181,6 @@ rules:
   - kubeflow.org
   resources:
   - mpijobs/finalizers
-  - mxjobs/finalizers
-  - mxjobs/status
   - paddlejobs/finalizers
   - pytorchjobs/finalizers
   - tfjobs/finalizers
@@ -234,6 +223,7 @@ rules:
   - clusterqueues/finalizers
   - localqueues/finalizers
   - resourceflavors/finalizers
+  - topologies/finalizers
   - workloads/finalizers
   verbs:
   - update
@@ -255,7 +245,6 @@ rules:
   - multikueueclusters
   - multikueueconfigs
   - provisioningrequestconfigs
-  - topologies
   - workloadpriorityclasses
   verbs:
   - get
@@ -270,6 +259,23 @@ rules:
   - get
   - list
   - update
+  - watch
+- apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - topologies
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - leaderworkerset.x-k8s.io
+  resources:
+  - leaderworkersets
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - node.k8s.io
@@ -294,11 +300,18 @@ rules:
   - ray.io
   resources:
   - rayclusters/finalizers
-  - rayclusters/status
   - rayjobs/finalizers
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - ray.io
+  resources:
+  - rayclusters/status
   - rayjobs/status
   verbs:
   - get
+  - patch
   - update
 - apiGroups:
   - scheduling.k8s.io
@@ -308,3 +321,28 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - workload.codeflare.dev
+  resources:
+  - appwrappers
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - workload.codeflare.dev
+  resources:
+  - appwrappers/finalizers
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - workload.codeflare.dev
+  resources:
+  - appwrappers/status
+  verbs:
+  - get
+  - patch
+  - update

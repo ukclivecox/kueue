@@ -52,9 +52,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for PyTorchJob", func() {
 		}
 		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
 
-		topology = testing.MakeTopology("datacenter").
-			Levels(topologyLevelBlock, topologyLevelRack, corev1.LabelHostname).
-			Obj()
+		topology = testing.MakeDefaultThreeLevelTopology("datacenter")
 		gomega.Expect(k8sClient.Create(ctx, topology)).Should(gomega.Succeed())
 
 		tasFlavor = testing.MakeResourceFlavor("tas-flavor").
@@ -84,6 +82,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for PyTorchJob", func() {
 		util.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
 		util.ExpectObjectToBeDeleted(ctx, k8sClient, tasFlavor, true)
 		util.ExpectObjectToBeDeleted(ctx, k8sClient, topology, true)
+		util.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
 	})
 
 	ginkgo.When("Creating a PyTorchJob", func() {
@@ -105,7 +104,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for PyTorchJob", func() {
 						ReplicaCount:  masterReplicas,
 						RestartPolicy: kftraining.RestartPolicyOnFailure,
 						Annotations: map[string]string{
-							kueuealpha.PodSetPreferredTopologyAnnotation: topologyLevelRack,
+							kueuealpha.PodSetPreferredTopologyAnnotation: testing.DefaultRackTopologyLevel,
 						},
 					},
 					testingpytorchjob.PyTorchReplicaSpecRequirement{
@@ -115,7 +114,7 @@ var _ = ginkgo.Describe("TopologyAwareScheduling for PyTorchJob", func() {
 						ReplicaCount:  workerReplicas,
 						RestartPolicy: kftraining.RestartPolicyOnFailure,
 						Annotations: map[string]string{
-							kueuealpha.PodSetPreferredTopologyAnnotation: topologyLevelBlock,
+							kueuealpha.PodSetPreferredTopologyAnnotation: testing.DefaultBlockTopologyLevel,
 						},
 					},
 				).

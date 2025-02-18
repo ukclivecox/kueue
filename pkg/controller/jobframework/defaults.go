@@ -20,13 +20,18 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
+	"sigs.k8s.io/kueue/pkg/cache"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/features"
+	"sigs.k8s.io/kueue/pkg/queue"
 )
 
 func ApplyDefaultForSuspend(ctx context.Context, job GenericJob, k8sClient client.Client,
@@ -40,6 +45,8 @@ func ApplyDefaultForSuspend(ctx context.Context, job GenericJob, k8sClient clien
 	}
 	return nil
 }
+
+// +kubebuilder:rbac:groups="apps",resources=replicasets,verbs=get;list;watch
 
 // WorkloadShouldBeSuspended determines whether jobObj should be default suspended on creation
 func WorkloadShouldBeSuspended(ctx context.Context, jobObj client.Object, k8sClient client.Client,
@@ -77,11 +84,38 @@ func ApplyDefaultLocalQueue(jobObj client.Object, defaultQueueExist func(string)
 		return
 	}
 	if QueueNameForObject(jobObj) == "" {
+		// Do not default the queue-name for a job whose owner is already managed by Kueue
+		if owner := metav1.GetControllerOf(jobObj); owner != nil && IsOwnerManagedByKueue(owner) {
+			return
+		}
 		labels := jobObj.GetLabels()
 		if labels == nil {
 			labels = make(map[string]string, 1)
 		}
 		labels[constants.QueueLabel] = constants.DefaultLocalQueueName
 		jobObj.SetLabels(labels)
+	}
+}
+
+func ApplyDefaultForManagedBy(job GenericJob, queues *queue.Manager, cache *cache.Cache, log logr.Logger) {
+	if managedJob, ok := job.(JobWithManagedBy); ok {
+		if managedJob.CanDefaultManagedBy() {
+			localQueueName, found := job.Object().GetLabels()[constants.QueueLabel]
+			if !found {
+				return
+			}
+			clusterQueueName, ok := queues.ClusterQueueFromLocalQueue(queue.QueueKey(job.Object().GetNamespace(), localQueueName))
+			if !ok {
+				log.V(5).Info("Cluster queue for local queue not found", "localQueueName", localQueueName)
+				return
+			}
+			for _, admissionCheck := range cache.AdmissionChecksForClusterQueue(clusterQueueName) {
+				if admissionCheck.Controller == kueue.MultiKueueControllerName {
+					log.V(5).Info("Defaulting ManagedBy", "oldManagedBy", managedJob.ManagedBy(), "managedBy", kueue.MultiKueueControllerName)
+					managedJob.SetManagedBy(ptr.To(kueue.MultiKueueControllerName))
+					return
+				}
+			}
+		}
 	}
 }

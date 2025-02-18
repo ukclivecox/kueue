@@ -35,7 +35,7 @@ $ helm install kueue kueue/ --create-namespace --namespace kueue-system
 Or use the charts pushed to `us-central1-docker.pkg.dev/k8s-staging-images/charts/kueue`:
 
 ```bash
-helm install kueue oci://us-central1-docker.pkg.dev/k8s-staging-images/charts/kueue --version="v0.9.1" --create-namespace --namespace=kueue-system
+helm install kueue oci://us-central1-docker.pkg.dev/k8s-staging-images/charts/kueue --version="v0.10.1" --create-namespace --namespace=kueue-system
 ```
 
 ##### Verify that controller pods are running properly.
@@ -57,7 +57,6 @@ The following table lists the configurable parameters of the kueue chart and the
 | `enablePrometheus`                                     | enable Prometheus                                      | `false`                                     |
 | `enableCertManager`                                    | enable CertManager                                     | `false`                                     |
 | `enableVisibilityAPF`                                  | enable APF for the visibility API                      | `false`                                     |
-| `controllerManager.kubeRbacProxy.image`                | controllerManager.kubeRbacProxy's image                | `registry.k8s.io/kubebuilder/kube-rbac-proxy:v0.8.0` |
 | `controllerManager.manager.image.repository`           | controllerManager.manager's repository and image       | `us-central1-docker.pkg.dev/k8s-staging-images/kueue/kueue` |
 | `controllerManager.manager.image.tag`                  | controllerManager.manager's tag                        | `main`                                      |
 | `controllerManager.manager.resources`                  | controllerManager.manager's resources                  | abbr.                                       |

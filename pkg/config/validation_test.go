@@ -52,7 +52,7 @@ func TestValidate(t *testing.T) {
 	systemNamespacesSelector := &metav1.LabelSelector{
 		MatchExpressions: []metav1.LabelSelectorRequirement{
 			{
-				Key:      "kubernetes.io/metadata.name",
+				Key:      corev1.LabelMetadataName,
 				Operator: metav1.LabelSelectorOpNotIn,
 				Values:   []string{"kube-system", "kueue-system"},
 			},
@@ -280,7 +280,7 @@ func TestValidate(t *testing.T) {
 					PodOptions: &configapi.PodIntegrationOptions{
 						NamespaceSelector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
-								"kubernetes.io/metadata.name": "kube-system",
+								corev1.LabelMetadataName: "kube-system",
 							},
 						},
 					},
@@ -298,7 +298,7 @@ func TestValidate(t *testing.T) {
 				QueueVisibility: defaultQueueVisibility,
 				ManagedJobsNamespaceSelector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						"kubernetes.io/metadata.name": "kube-system",
+						corev1.LabelMetadataName: "kube-system",
 					},
 				},
 				Integrations: defaultIntegrations,
@@ -320,7 +320,7 @@ func TestValidate(t *testing.T) {
 						NamespaceSelector: &metav1.LabelSelector{
 							MatchExpressions: []metav1.LabelSelectorRequirement{
 								{
-									Key:      "kubernetes.io/metadata.name",
+									Key:      corev1.LabelMetadataName,
 									Operator: metav1.LabelSelectorOpIn,
 									Values:   []string{"kube-system"},
 								},
@@ -342,7 +342,7 @@ func TestValidate(t *testing.T) {
 				ManagedJobsNamespaceSelector: &metav1.LabelSelector{
 					MatchExpressions: []metav1.LabelSelectorRequirement{
 						{
-							Key:      "kubernetes.io/metadata.name",
+							Key:      corev1.LabelMetadataName,
 							Operator: metav1.LabelSelectorOpIn,
 							Values:   []string{"kube-system"},
 						},
@@ -367,7 +367,7 @@ func TestValidate(t *testing.T) {
 						NamespaceSelector: &metav1.LabelSelector{
 							MatchExpressions: []metav1.LabelSelectorRequirement{
 								{
-									Key:      "kubernetes.io/metadata.name",
+									Key:      corev1.LabelMetadataName,
 									Operator: metav1.LabelSelectorOpNotIn,
 									Values:   []string{"kube-system", "kueue-system"},
 								},
@@ -384,7 +384,7 @@ func TestValidate(t *testing.T) {
 				ManagedJobsNamespaceSelector: &metav1.LabelSelector{
 					MatchExpressions: []metav1.LabelSelectorRequirement{
 						{
-							Key:      "kubernetes.io/metadata.name",
+							Key:      corev1.LabelMetadataName,
 							Operator: metav1.LabelSelectorOpNotIn,
 							Values:   []string{"kube-system", "kueue-system"},
 						},
@@ -703,6 +703,39 @@ func TestValidate(t *testing.T) {
 			features.SetFeatureGateDuringTest(t, features.ManagedJobsNamespaceSelector, tc.managedJobsFeatureGate)
 			if diff := cmp.Diff(tc.wantErr, validate(tc.cfg, testScheme), cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")); diff != "" {
 				t.Errorf("Unexpected returned error (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestValidateFeatureGates(t *testing.T) {
+	cases := map[string]struct {
+		featureGatesCLI string
+		featureGateMap  map[string]bool
+		errorStr        string
+	}{
+		"no feature gates is null": {
+			featureGatesCLI: "",
+			featureGateMap:  nil,
+			errorStr:        "",
+		},
+		"feature gate cli": {
+			featureGatesCLI: "test:true",
+			featureGateMap:  nil,
+			errorStr:        "",
+		},
+		"cannot specify both feature gates": {
+			featureGatesCLI: "test:true",
+			featureGateMap:  map[string]bool{"test": true},
+
+			errorStr: "feature gates for CLI and configuration cannot both specified",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := ValidateFeatureGates(tc.featureGatesCLI, tc.featureGateMap)
+			if got != nil && tc.errorStr != got.Error() {
+				t.Errorf("Unexpected result from ValidateFeatureGates\nwant:\n%v\ngot:%v\n", tc.errorStr, got.Error())
 			}
 		})
 	}

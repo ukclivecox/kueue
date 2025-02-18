@@ -28,6 +28,8 @@ If you are using Kueue, feel free to open a pull request to add your organizatio
 |        [Google Cloud](https://cloud.google.com/)        | Provider |    Part of [kit for training ML workloads on TPUs][gcmldemo]    |                JobSet                 |     [@mrozacki](https://github.com/mrozacki)     |
 |       [Onna Technologies, Inc](https://onna.com)        | End User |              Unstructured Data Management Platform              |            batch/job </br>            |     [@gitcarbs](https://github.com/gitcarbs)     |
 |       [IBM Research](https://research.ibm.com)          | End User | Part of [MLBatch][mlbatch] stack for running AI/ML workloads    | AppWrapper</br>PyTorchJob</br>RayJob  |    [dgrove-oss](https://github.com/dgrove-oss)   |
+|       [Innovatrics](https://www.innovatrics.com/)       | End User |                     On-premise ML Platform                      |          batch/job </br> pod          |    [@mmolisch](https://github.com/mmolisch)      |
+| [Red Hat, Inc.](https://www.redhat.com/en) | End User | Cloud/On-premise ML Platform | Ray Cluster <br> RayJob <br> Pytorch Job <br> TensorFlow Job <br> ... | [@varshaprasad96](https://github.com/varshaprasad96) |
 
 [gcmldemo]: https://cloud.google.com/blog/products/compute/the-worlds-largest-distributed-llm-training-job-on-tpu-v5e
 [mlbatch]: https://github.com/project-codeflare/mlbatch

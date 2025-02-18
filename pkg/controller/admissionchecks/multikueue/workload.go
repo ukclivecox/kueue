@@ -180,7 +180,16 @@ func (w *wlReconciler) Reconcile(ctx context.Context, req reconcile.Request) (re
 	}
 
 	if mkAc == nil || mkAc.State == kueue.CheckStateRejected {
-		log.V(2).Info("Skip Workload")
+		log.V(2).Info("Skip Workload", "isDeleted", isDeleted)
+		if isDeleted {
+			// Delete the workload from the cache considering the following case:
+			//    The workload is not admitted by MultiKueue and so there are
+			//    no workloads on worker clusters created, we can safely drop it
+			//    from the cache.
+			//    TODO(#3840): Ideally, we would not add it to the cache in the
+			//    first place.
+			w.deletedWlCache.Delete(req.String())
+		}
 		return reconcile.Result{}, nil
 	}
 
@@ -233,7 +242,7 @@ func (w *wlReconciler) updateACS(ctx context.Context, wl *kueue.Workload, acs *k
 	acs.Message = message
 	acs.LastTransitionTime = metav1.NewTime(w.clock.Now())
 	wlPatch := workload.BaseSSAWorkload(wl)
-	workload.SetAdmissionCheckState(&wlPatch.Status.AdmissionChecks, *acs)
+	workload.SetAdmissionCheckState(&wlPatch.Status.AdmissionChecks, *acs, w.clock)
 	return w.client.Status().Patch(ctx, wlPatch, client.Apply, client.FieldOwner(kueue.MultiKueueControllerName), client.ForceOwnership)
 }
 
@@ -314,7 +323,7 @@ func (w *wlReconciler) reconcileGroup(ctx context.Context, group *wlGroup) (reco
 
 	// 1. delete all remote workloads when finished or the local wl has no reservation
 	if group.IsFinished() || !workload.HasQuotaReservation(group.local) {
-		errs := []error{}
+		var errs []error
 		for rem := range group.remotes {
 			if err := group.RemoveRemoteObjects(ctx, rem); err != nil {
 				errs = append(errs, err)
@@ -393,7 +402,7 @@ func (w *wlReconciler) reconcileGroup(ctx context.Context, group *wlGroup) (reco
 			acs.LastTransitionTime = metav1.NewTime(w.clock.Now())
 
 			wlPatch := workload.BaseSSAWorkload(group.local)
-			workload.SetAdmissionCheckState(&wlPatch.Status.AdmissionChecks, *acs)
+			workload.SetAdmissionCheckState(&wlPatch.Status.AdmissionChecks, *acs, w.clock)
 			err := w.client.Status().Patch(ctx, wlPatch, client.Apply, client.FieldOwner(kueue.MultiKueueControllerName), client.ForceOwnership)
 			if err != nil {
 				return reconcile.Result{}, err
@@ -412,7 +421,7 @@ func (w *wlReconciler) reconcileGroup(ctx context.Context, group *wlGroup) (reco
 			acs.Message = "Reserving remote lost"
 			acs.LastTransitionTime = metav1.NewTime(w.clock.Now())
 			wlPatch := workload.BaseSSAWorkload(group.local)
-			workload.SetAdmissionCheckState(&wlPatch.Status.AdmissionChecks, *acs)
+			workload.SetAdmissionCheckState(&wlPatch.Status.AdmissionChecks, *acs, w.clock)
 			return reconcile.Result{}, w.client.Status().Patch(ctx, wlPatch, client.Apply, client.FieldOwner(kueue.MultiKueueControllerName), client.ForceOwnership)
 		}
 	}
@@ -483,7 +492,7 @@ func (w *wlReconciler) setupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		Named("multikueue-workload").
+		Named("multikueue_workload").
 		For(&kueue.Workload{}).
 		WatchesRawSource(source.Channel(w.clusters.wlUpdateCh, syncHndl)).
 		WithEventFilter(w).
