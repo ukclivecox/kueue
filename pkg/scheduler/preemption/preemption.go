@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -38,10 +38,11 @@ import (
 	config "sigs.k8s.io/kueue/apis/config/v1beta1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/cache"
+	"sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	"sigs.k8s.io/kueue/pkg/resources"
 	"sigs.k8s.io/kueue/pkg/scheduler/flavorassigner"
-	"sigs.k8s.io/kueue/pkg/util/heap"
+	"sigs.k8s.io/kueue/pkg/scheduler/preemption/fairsharing"
 	"sigs.k8s.io/kueue/pkg/util/priority"
 	"sigs.k8s.io/kueue/pkg/util/routine"
 	"sigs.k8s.io/kueue/pkg/workload"
@@ -57,7 +58,7 @@ type Preemptor struct {
 
 	workloadOrdering  workload.Ordering
 	enableFairSharing bool
-	fsStrategies      []fsStrategy
+	fsStrategies      []fairsharing.Strategy
 
 	// stubs
 	applyPreemption func(ctx context.Context, w *kueue.Workload, reason, message string) error
@@ -68,7 +69,8 @@ type preemptionCtx struct {
 	preemptor         workload.Info
 	preemptorCQ       *cache.ClusterQueueSnapshot
 	snapshot          *cache.Snapshot
-	requests          resources.FlavorResourceQuantities
+	workloadUsage     workload.Usage
+	tasRequests       cache.WorkloadTASRequests
 	frsNeedPreemption sets.Set[resources.FlavorResource]
 }
 
@@ -95,7 +97,7 @@ func (p *Preemptor) OverrideApply(f func(context.Context, *kueue.Workload, strin
 	p.applyPreemption = f
 }
 
-func candidatesOnlyFromQueue(candidates []*workload.Info, clusterQueue string) []*workload.Info {
+func candidatesOnlyFromQueue(candidates []*workload.Info, clusterQueue kueue.ClusterQueueReference) []*workload.Info {
 	result := make([]*workload.Info, 0, len(candidates))
 	for _, wi := range candidates {
 		if wi.ClusterQueue == clusterQueue {
@@ -105,7 +107,7 @@ func candidatesOnlyFromQueue(candidates []*workload.Info, clusterQueue string) [
 	return result
 }
 
-func candidatesFromCQOrUnderThreshold(candidates []*workload.Info, clusterQueue string, threshold int32) []*workload.Info {
+func candidatesFromCQOrUnderThreshold(candidates []*workload.Info, clusterQueue kueue.ClusterQueueReference, threshold int32) []*workload.Info {
 	result := make([]*workload.Info, 0, len(candidates))
 	for _, wi := range candidates {
 		if wi.ClusterQueue == clusterQueue || priority.Priority(wi.Obj) < threshold {
@@ -123,13 +125,19 @@ type Target struct {
 // GetTargets returns the list of workloads that should be evicted in
 // order to make room for wl.
 func (p *Preemptor) GetTargets(log logr.Logger, wl workload.Info, assignment flavorassigner.Assignment, snapshot *cache.Snapshot) []*Target {
+	cq := snapshot.ClusterQueue(wl.ClusterQueue)
+	tasRequests := assignment.WorkloadsTopologyRequests(&wl, cq)
 	return p.getTargets(&preemptionCtx{
 		log:               log,
 		preemptor:         wl,
-		preemptorCQ:       snapshot.ClusterQueues[wl.ClusterQueue],
+		preemptorCQ:       cq,
 		snapshot:          snapshot,
-		requests:          assignment.TotalRequestsFor(&wl),
+		tasRequests:       tasRequests,
 		frsNeedPreemption: flavorResourcesNeedPreemption(assignment),
+		workloadUsage: workload.Usage{
+			Quota: assignment.TotalRequestsFor(&wl),
+			TAS:   wl.TASUsage(),
+		},
 	})
 }
 
@@ -139,6 +147,9 @@ func (p *Preemptor) getTargets(preemptionCtx *preemptionCtx) []*Target {
 		return nil
 	}
 	sort.Slice(candidates, candidatesOrdering(candidates, preemptionCtx.preemptorCQ.Name, p.clock.Now()))
+	if p.enableFairSharing {
+		return fairPreemptions(preemptionCtx, candidates, p.fsStrategies)
+	}
 
 	sameQueueCandidates := candidatesOnlyFromQueue(candidates, preemptionCtx.preemptorCQ.Name)
 
@@ -153,16 +164,12 @@ func (p *Preemptor) getTargets(preemptionCtx *preemptionCtx) []*Target {
 		return minimalPreemptions(preemptionCtx, candidates, true, nil)
 	}
 
-	borrowWithinCohort, thresholdPrio := canBorrowWithinCohort(preemptionCtx)
-	if p.enableFairSharing {
-		return p.fairPreemptions(preemptionCtx, candidates, thresholdPrio)
-	}
 	// There is a potential of preemption of workloads from the other queue in the
 	// cohort. We proceed with borrowing only if the dedicated policy
 	// (borrowWithinCohort) is enabled. This ensures the preempted workloads
 	// have lower priority, and so they will not preempt the preemptor when
 	// requeued.
-	if borrowWithinCohort {
+	if borrowWithinCohort, thresholdPrio := canBorrowWithinCohort(preemptionCtx); borrowWithinCohort {
 		if !queueUnderNominalInResourcesNeedingPreemption(preemptionCtx) {
 			// It can only preempt workloads from another CQ if they are strictly under allowBorrowingBelowPriority.
 			candidates = candidatesFromCQOrUnderThreshold(candidates, preemptionCtx.preemptor.ClusterQueue, *thresholdPrio)
@@ -199,8 +206,26 @@ func canBorrowWithinCohort(preemptionCtx *preemptionCtx) (bool, *int32) {
 var HumanReadablePreemptionReasons = map[string]string{
 	kueue.InClusterQueueReason:                "prioritization in the ClusterQueue",
 	kueue.InCohortReclamationReason:           "reclamation within the cohort",
-	kueue.InCohortFairSharingReason:           "fair sharing within the cohort",
+	kueue.InCohortFairSharingReason:           "Fair Sharing within the cohort",
 	kueue.InCohortReclaimWhileBorrowingReason: "reclamation within the cohort while borrowing",
+	"": "UNKNOWN",
+}
+
+func preemptionMessage(preemptor *kueue.Workload, reason string) string {
+	var wUID, jUID string
+	if preemptor == nil || preemptor.UID == "" {
+		wUID = "UNKNOWN"
+	} else {
+		wUID = string(preemptor.UID)
+	}
+	uid, ok := preemptor.Labels[constants.JobUIDLabel]
+	if !ok || uid == "" {
+		jUID = "UNKNOWN"
+	} else {
+		jUID = uid
+	}
+
+	return fmt.Sprintf("Preempted to accommodate a workload (UID: %s, JobUID: %s) due to %s", wUID, jUID, HumanReadablePreemptionReasons[reason])
 }
 
 // IssuePreemptions marks the target workloads as evicted.
@@ -213,18 +238,18 @@ func (p *Preemptor) IssuePreemptions(ctx context.Context, preemptor *workload.In
 	workqueue.ParallelizeUntil(ctx, parallelPreemptions, len(targets), func(i int) {
 		target := targets[i]
 		if !meta.IsStatusConditionTrue(target.WorkloadInfo.Obj.Status.Conditions, kueue.WorkloadEvicted) {
-			message := fmt.Sprintf("Preempted to accommodate a workload (UID: %s) due to %s", preemptor.Obj.UID, HumanReadablePreemptionReasons[target.Reason])
+			message := preemptionMessage(preemptor.Obj, target.Reason)
 			err := p.applyPreemption(ctx, target.WorkloadInfo.Obj, target.Reason, message)
 			if err != nil {
 				errCh.SendErrorWithCancel(err, cancel)
 				return
 			}
 
-			log.V(3).Info("Preempted", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "reason", target.Reason, "message", message, "targetClusterQueue", klog.KRef("", target.WorkloadInfo.ClusterQueue))
+			log.V(3).Info("Preempted", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "preemptingWorkload", klog.KObj(preemptor.Obj), "reason", target.Reason, "message", message, "targetClusterQueue", klog.KRef("", string(target.WorkloadInfo.ClusterQueue)))
 			p.recorder.Eventf(target.WorkloadInfo.Obj, corev1.EventTypeNormal, "Preempted", message)
 			metrics.ReportPreemption(preemptor.ClusterQueue, target.Reason, target.WorkloadInfo.ClusterQueue)
 		} else {
-			log.V(3).Info("Preemption ongoing", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj))
+			log.V(3).Info("Preemption ongoing", "targetWorkload", klog.KObj(target.WorkloadInfo.Obj), "preemptingWorkload", klog.KObj(preemptor.Obj))
 		}
 		successfullyPreempted.Add(1)
 	})
@@ -249,13 +274,13 @@ func (p *Preemptor) applyPreemptionWithSSA(ctx context.Context, w *kueue.Workloa
 // fits.
 func minimalPreemptions(preemptionCtx *preemptionCtx, candidates []*workload.Info, allowBorrowing bool, allowBorrowingBelowPriority *int32) []*Target {
 	if logV := preemptionCtx.log.V(5); logV.Enabled() {
-		logV.Info("Simulating preemption", "candidates", workload.References(candidates), "resourcesRequiringPreemption", preemptionCtx.frsNeedPreemption, "allowBorrowing", allowBorrowing, "allowBorrowingBelowPriority", allowBorrowingBelowPriority)
+		logV.Info("Simulating preemption", "candidates", workload.References(candidates), "resourcesRequiringPreemption", preemptionCtx.frsNeedPreemption.UnsortedList(), "allowBorrowing", allowBorrowing, "allowBorrowingBelowPriority", allowBorrowingBelowPriority, "preemptingWorkload", klog.KObj(preemptionCtx.preemptor.Obj))
 	}
 	// Simulate removing all candidates from the ClusterQueue and cohort.
 	var targets []*Target
 	fits := false
 	for _, candWl := range candidates {
-		candCQ := preemptionCtx.snapshot.ClusterQueues[candWl.ClusterQueue]
+		candCQ := preemptionCtx.snapshot.ClusterQueue(candWl.ClusterQueue)
 		reason := kueue.InClusterQueueReason
 		if preemptionCtx.preemptorCQ != candCQ {
 			if !cqIsBorrowing(candCQ, preemptionCtx.frsNeedPreemption) {
@@ -322,125 +347,112 @@ func restoreSnapshot(snapshot *cache.Snapshot, targets []*Target) {
 	}
 }
 
-type fsStrategy func(preemptorNewShare, preempteeOldShare, preempteeNewShare int) bool
-
-// lessThanOrEqualToFinalShare implements Rule S2-a in https://sigs.k8s.io/kueue/keps/1714-fair-sharing#choosing-workloads-from-clusterqueues-for-preemption
-func lessThanOrEqualToFinalShare(preemptorNewShare, _, preempteeNewShare int) bool {
-	return preemptorNewShare <= preempteeNewShare
-}
-
-// lessThanInitialShare implements rule S2-b in https://sigs.k8s.io/kueue/keps/1714-fair-sharing#choosing-workloads-from-clusterqueues-for-preemption
-func lessThanInitialShare(preemptorNewShare, preempteeOldShare, _ int) bool {
-	return preemptorNewShare < preempteeOldShare
-}
-
 // parseStrategies converts an array of strategies into the functions to the used by the algorithm.
 // This function takes advantage of the properties of the preemption algorithm and the strategies.
 // The number of functions returned might not match the input slice.
-func parseStrategies(s []config.PreemptionStrategy) []fsStrategy {
+func parseStrategies(s []config.PreemptionStrategy) []fairsharing.Strategy {
 	if len(s) == 0 {
-		return []fsStrategy{lessThanOrEqualToFinalShare, lessThanInitialShare}
+		return []fairsharing.Strategy{fairsharing.LessThanOrEqualToFinalShare, fairsharing.LessThanInitialShare}
 	}
-	strategies := make([]fsStrategy, len(s))
+	strategies := make([]fairsharing.Strategy, len(s))
 	for i, strategy := range s {
 		switch strategy {
 		case config.LessThanOrEqualToFinalShare:
-			strategies[i] = lessThanOrEqualToFinalShare
+			strategies[i] = fairsharing.LessThanOrEqualToFinalShare
 		case config.LessThanInitialShare:
-			strategies[i] = lessThanInitialShare
+			strategies[i] = fairsharing.LessThanInitialShare
 		}
 	}
 	return strategies
 }
 
-func (p *Preemptor) fairPreemptions(preemptionCtx *preemptionCtx, candidates []*workload.Info, allowBorrowingBelowPriority *int32) []*Target {
-	if logV := preemptionCtx.log.V(5); logV.Enabled() {
-		logV.Info("Simulating fair preemption", "candidates", workload.References(candidates), "resourcesRequiringPreemption", preemptionCtx.frsNeedPreemption, "allowBorrowingBelowPriority", allowBorrowingBelowPriority)
-	}
-	requests := preemptionCtx.requests
-	cqHeap := cqHeapFromCandidates(candidates, false, preemptionCtx.snapshot)
-	newNominatedShareValue, _ := preemptionCtx.preemptorCQ.DominantResourceShareWith(requests)
+// runFirstFsStrategy runs the first configured FairSharing strategy,
+// and returns (fits, targets, retryCandidates) retryCandidates may be
+// used if rule S2-b is configured.
+func runFirstFsStrategy(preemptionCtx *preemptionCtx, candidates []*workload.Info, strategy fairsharing.Strategy) (bool, []*Target, []*workload.Info) {
+	ordering := fairsharing.MakeClusterQueueOrdering(preemptionCtx.preemptorCQ, candidates)
 	var targets []*Target
-	fits := false
 	var retryCandidates []*workload.Info
-	for cqHeap.Len() > 0 && !fits {
-		candCQ := cqHeap.Pop()
-
-		if candCQ.cq == preemptionCtx.preemptorCQ {
-			candWl := candCQ.workloads[0]
+	for candCQ := range ordering.Iter() {
+		if candCQ.InClusterQueuePreemption() {
+			candWl := candCQ.PopWorkload()
 			preemptionCtx.snapshot.RemoveWorkload(candWl)
 			targets = append(targets, &Target{
 				WorkloadInfo: candWl,
 				Reason:       kueue.InClusterQueueReason,
 			})
-			if workloadFits(preemptionCtx, true) {
-				fits = true
-				break
-			}
-			newNominatedShareValue, _ = preemptionCtx.preemptorCQ.DominantResourceShareWith(requests)
-			candCQ.workloads = candCQ.workloads[1:]
-			if len(candCQ.workloads) > 0 {
-				candCQ.share, _ = candCQ.cq.DominantResourceShare()
-				cqHeap.PushIfNotPresent(candCQ)
+			if workloadFitsForFairSharing(preemptionCtx) {
+				return true, targets, nil
 			}
 			continue
 		}
 
-		for i, candWl := range candCQ.workloads {
-			belowThreshold := allowBorrowingBelowPriority != nil && priority.Priority(candWl.Obj) < *allowBorrowingBelowPriority
-			newCandShareVal, _ := candCQ.cq.DominantResourceShareWithout(candWl.FlavorResourceUsage())
-			strategy := p.fsStrategies[0](newNominatedShareValue, candCQ.share, newCandShareVal)
-			if belowThreshold || strategy {
+		preemptorNewShare, targetOldShare := candCQ.ComputeShares()
+		for candCQ.HasWorkload() {
+			candWl := candCQ.PopWorkload()
+			targetNewShare := candCQ.ComputeTargetShareAfterRemoval(candWl)
+			if strategy(preemptorNewShare, targetOldShare, targetNewShare) {
 				preemptionCtx.snapshot.RemoveWorkload(candWl)
 				reason := kueue.InCohortFairSharingReason
-				if !strategy {
-					reason = kueue.InCohortReclaimWhileBorrowingReason
-				}
 
 				targets = append(targets, &Target{
 					WorkloadInfo: candWl,
 					Reason:       reason,
 				})
-				if workloadFits(preemptionCtx, true) {
-					fits = true
-					break
-				}
-				candCQ.workloads = candCQ.workloads[i+1:]
-				if len(candCQ.workloads) > 0 && cqIsBorrowing(candCQ.cq, preemptionCtx.frsNeedPreemption) {
-					candCQ.share = newCandShareVal
-					cqHeap.PushIfNotPresent(candCQ)
+				if workloadFitsForFairSharing(preemptionCtx) {
+					return true, targets, nil
 				}
 				// Might need to pick a different CQ due to changing values.
 				break
 			} else {
-				retryCandidates = append(retryCandidates, candCQ.workloads[i])
+				retryCandidates = append(retryCandidates, candWl)
 			}
 		}
 	}
-	if !fits && len(p.fsStrategies) > 1 {
-		// Try next strategy if the previous strategy wasn't enough
-		cqHeap = cqHeapFromCandidates(retryCandidates, true, preemptionCtx.snapshot)
+	return false, targets, retryCandidates
+}
 
-		for cqHeap.Len() > 0 && !fits {
-			candCQ := cqHeap.Pop()
-			// Due to API validation, we can only reach here if the second strategy is LessThanInitialShare,
-			// in which case the last parameter for the strategy function is irrelevant.
-			if p.fsStrategies[1](newNominatedShareValue, candCQ.share, 0) {
-				// The criteria doesn't depend on the preempted workload, so just preempt the first candidate.
-				candWl := candCQ.workloads[0]
-				preemptionCtx.snapshot.RemoveWorkload(candWl)
-				targets = append(targets, &Target{
-					WorkloadInfo: candWl,
-					Reason:       kueue.InCohortFairSharingReason,
-				})
-				if workloadFits(preemptionCtx, true) {
-					fits = true
-				}
-				// No requeueing because there doesn't seem to be an scenario where
-				// it's possible to apply rule S2-b more than once in a CQ.
+// runSecondFsStrategy implements Fair Sharing Rule S2-b. It returns
+// (fits, targets).
+func runSecondFsStrategy(retryCandidates []*workload.Info, preemptionCtx *preemptionCtx, targets []*Target) (bool, []*Target) {
+	ordering := fairsharing.MakeClusterQueueOrdering(preemptionCtx.preemptorCQ, retryCandidates)
+	for candCQ := range ordering.Iter() {
+		preemptorNewShare, targetOldShare := candCQ.ComputeShares()
+		// Due to API validation, we can only reach here if the second strategy is LessThanInitialShare,
+		// in which case the last parameter for the strategy function is irrelevant.
+		if fairsharing.LessThanInitialShare(preemptorNewShare, targetOldShare, 0) {
+			// The criteria doesn't depend on the preempted workload, so just preempt the first candidate.
+			candWl := candCQ.PopWorkload()
+			preemptionCtx.snapshot.RemoveWorkload(candWl)
+			targets = append(targets, &Target{
+				WorkloadInfo: candWl,
+				Reason:       kueue.InCohortFairSharingReason,
+			})
+			if workloadFitsForFairSharing(preemptionCtx) {
+				return true, targets
 			}
 		}
+		// There doesn't seem to be an scenario where
+		// it's possible to apply rule S2-b more than once in a CQ.
+		ordering.DropQueue(candCQ)
 	}
+	return false, targets
+}
+
+func fairPreemptions(preemptionCtx *preemptionCtx, candidates []*workload.Info, strategies []fairsharing.Strategy) []*Target {
+	if logV := preemptionCtx.log.V(5); logV.Enabled() {
+		logV.Info("Simulating fair preemption", "candidates", workload.References(candidates), "resourcesRequiringPreemption", preemptionCtx.frsNeedPreemption.UnsortedList(), "preemptingWorkload", klog.KObj(preemptionCtx.preemptor.Obj))
+	}
+
+	// DRS values must include incoming workload.
+	revertSimulation := preemptionCtx.preemptorCQ.SimulateUsageAddition(preemptionCtx.workloadUsage)
+
+	fits, targets, retryCandidates := runFirstFsStrategy(preemptionCtx, candidates, strategies[0])
+	if !fits && len(strategies) > 1 {
+		fits, targets = runSecondFsStrategy(retryCandidates, preemptionCtx, targets)
+	}
+
+	revertSimulation()
 	if !fits {
 		restoreSnapshot(preemptionCtx.snapshot, targets)
 		return nil
@@ -448,39 +460,6 @@ func (p *Preemptor) fairPreemptions(preemptionCtx *preemptionCtx, candidates []*
 	targets = fillBackWorkloads(preemptionCtx, targets, true)
 	restoreSnapshot(preemptionCtx.snapshot, targets)
 	return targets
-}
-
-type candidateCQ struct {
-	cq        *cache.ClusterQueueSnapshot
-	workloads []*workload.Info
-	share     int
-}
-
-func cqHeapFromCandidates(candidates []*workload.Info, firstOnly bool, snapshot *cache.Snapshot) *heap.Heap[candidateCQ] {
-	cqHeap := heap.New(
-		func(c *candidateCQ) string {
-			return c.cq.Name
-		},
-		func(c1, c2 *candidateCQ) bool {
-			return c1.share > c2.share
-		},
-	)
-	for _, cand := range candidates {
-		candCQ := cqHeap.GetByKey(cand.ClusterQueue)
-		if candCQ == nil {
-			cq := snapshot.ClusterQueues[cand.ClusterQueue]
-			share, _ := cq.DominantResourceShare()
-			candCQ = &candidateCQ{
-				cq:        cq,
-				share:     share,
-				workloads: []*workload.Info{cand},
-			}
-			cqHeap.PushOrUpdate(candCQ)
-		} else if !firstOnly {
-			candCQ.workloads = append(candCQ.workloads, cand)
-		}
-	}
-	return cqHeap
 }
 
 func flavorResourcesNeedPreemption(assignment flavorassigner.Assignment) sets.Set[resources.FlavorResource] {
@@ -571,7 +550,7 @@ func workloadUsesResources(wl *workload.Info, frsNeedPreemption sets.Set[resourc
 // requestable resources and simulated usage of the ClusterQueue and its cohort,
 // if it belongs to one.
 func workloadFits(preemptionCtx *preemptionCtx, allowBorrowing bool) bool {
-	for fr, v := range preemptionCtx.requests {
+	for fr, v := range preemptionCtx.workloadUsage.Quota {
 		if !allowBorrowing && preemptionCtx.preemptorCQ.BorrowingWith(fr, v) {
 			return false
 		}
@@ -579,7 +558,19 @@ func workloadFits(preemptionCtx *preemptionCtx, allowBorrowing bool) bool {
 			return false
 		}
 	}
-	return true
+	tasResult := preemptionCtx.preemptorCQ.FindTopologyAssignmentsForWorkload(preemptionCtx.tasRequests, false)
+	return tasResult.Failure() == nil
+}
+
+// workloadFitsForFairSharing is a lightweight wrapper around
+// workloadFits, as we need to remove, and then add back, the usage of
+// the incoming workload, as FairSharing adds this usage at the start
+// of processing for accurate DominantResourceShare calculations.
+func workloadFitsForFairSharing(preemptionCtx *preemptionCtx) bool {
+	revertSimulation := preemptionCtx.preemptorCQ.SimulateUsageRemoval(preemptionCtx.workloadUsage)
+	res := workloadFits(preemptionCtx, true)
+	revertSimulation()
+	return res
 }
 
 func queueUnderNominalInResourcesNeedingPreemption(preemptionCtx *preemptionCtx) bool {
@@ -597,7 +588,7 @@ func queueUnderNominalInResourcesNeedingPreemption(preemptionCtx *preemptionCtx)
 // same ClusterQueue as the preemptor.
 // 2. Workloads with lower priority first.
 // 3. Workloads admitted more recently first.
-func candidatesOrdering(candidates []*workload.Info, cq string, now time.Time) func(int, int) bool {
+func candidatesOrdering(candidates []*workload.Info, cq kueue.ClusterQueueReference, now time.Time) func(int, int) bool {
 	return func(i, j int) bool {
 		a := candidates[i]
 		b := candidates[j]

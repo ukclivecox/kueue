@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,6 +33,7 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
 	podcontroller "sigs.k8s.io/kueue/pkg/controller/jobs/pod"
+	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
 
@@ -80,11 +80,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log := ctrl.LoggerFrom(ctx).WithValues("leaderworkerset", klog.KObj(lws))
-	ctx = ctrl.LoggerInto(ctx, log)
-	log.V(2).Info("Reconciling LeaderWorkerSet")
+	log := ctrl.LoggerFrom(ctx)
+	log.V(2).Info("Reconcile LeaderWorkerSet")
 
-	err = r.createPrebuildWorkloadsIfNotExist(ctx, lws)
+	err = r.createPrebuiltWorkloadsIfNotExist(ctx, lws)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -92,29 +91,39 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) createPrebuildWorkloadsIfNotExist(ctx context.Context, lws *leaderworkersetv1.LeaderWorkerSet) error {
+func (r *Reconciler) createPrebuiltWorkloadsIfNotExist(ctx context.Context, lws *leaderworkersetv1.LeaderWorkerSet) error {
 	replicas := ptr.Deref(lws.Spec.Replicas, 1)
 	for i := int32(0); i < replicas; i++ {
-		if err := r.createPrebuildWorkloadIfNotExist(ctx, lws, i); err != nil {
+		if err := r.createPrebuiltWorkloadIfNotExist(ctx, lws, i); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *Reconciler) createPrebuildWorkloadIfNotExist(ctx context.Context, lws *leaderworkersetv1.LeaderWorkerSet, index int32) error {
+func (r *Reconciler) createPrebuiltWorkloadIfNotExist(ctx context.Context, lws *leaderworkersetv1.LeaderWorkerSet, index int32) error {
 	wl := &kueue.Workload{}
 	err := r.client.Get(ctx, client.ObjectKey{Name: GetWorkloadName(lws.UID, lws.Name, fmt.Sprint(index)), Namespace: lws.Namespace}, wl)
 	// Ignore if the Workload already exists or an error occurs.
 	if err == nil || client.IgnoreNotFound(err) != nil {
 		return err
 	}
-	return r.createPrebuildWorkload(ctx, lws, index)
+	return r.createPrebuiltWorkload(ctx, lws, index)
 }
 
-func (r *Reconciler) createPrebuildWorkload(ctx context.Context, lws *leaderworkersetv1.LeaderWorkerSet, index int32) error {
+func (r *Reconciler) createPrebuiltWorkload(ctx context.Context, lws *leaderworkersetv1.LeaderWorkerSet, index int32) error {
 	createdWorkload := r.constructWorkload(lws, index)
-	err := r.client.Create(ctx, createdWorkload)
+
+	priorityClassName, source, p, err := jobframework.ExtractPriority(ctx, r.client, lws, createdWorkload.Spec.PodSets, nil)
+	if err != nil {
+		return err
+	}
+
+	createdWorkload.Spec.PriorityClassName = priorityClassName
+	createdWorkload.Spec.Priority = &p
+	createdWorkload.Spec.PriorityClassSource = source
+
+	err = r.client.Create(ctx, createdWorkload)
 	if err != nil {
 		return err
 	}
@@ -133,19 +142,20 @@ func (r *Reconciler) podSets(lws *leaderworkersetv1.LeaderWorkerSet) []kueue.Pod
 	podSets := make([]kueue.PodSet, 0, 2)
 
 	if lws.Spec.LeaderWorkerTemplate.LeaderTemplate != nil {
-		podSets = append(podSets, kueue.PodSet{
+		podSet := kueue.PodSet{
 			Name:  leaderPodSetName,
 			Count: 1,
 			Template: corev1.PodTemplateSpec{
 				Spec: *lws.Spec.LeaderWorkerTemplate.LeaderTemplate.Spec.DeepCopy(),
 			},
-			TopologyRequest: jobframework.PodSetTopologyRequest(
+		}
+		if features.Enabled(features.TopologyAwareScheduling) {
+			podSet.TopologyRequest = jobframework.PodSetTopologyRequest(
 				&lws.Spec.LeaderWorkerTemplate.LeaderTemplate.ObjectMeta,
-				nil,
-				nil,
-				nil,
-			),
-		})
+				nil, nil, nil,
+			)
+		}
+		podSets = append(podSets, podSet)
 	}
 
 	defaultPodSetName := kueue.DefaultPodSetName
@@ -158,19 +168,23 @@ func (r *Reconciler) podSets(lws *leaderworkersetv1.LeaderWorkerSet) []kueue.Pod
 		defaultPodSetCount--
 	}
 
-	podSets = append(podSets, kueue.PodSet{
+	podSet := kueue.PodSet{
 		Name:  defaultPodSetName,
 		Count: defaultPodSetCount,
 		Template: corev1.PodTemplateSpec{
 			Spec: *lws.Spec.LeaderWorkerTemplate.WorkerTemplate.Spec.DeepCopy(),
 		},
-		TopologyRequest: jobframework.PodSetTopologyRequest(
+	}
+
+	if features.Enabled(features.TopologyAwareScheduling) {
+		podSet.TopologyRequest = jobframework.PodSetTopologyRequest(
 			&lws.Spec.LeaderWorkerTemplate.WorkerTemplate.ObjectMeta,
 			ptr.To(leaderworkersetv1.WorkerIndexLabelKey),
-			nil,
-			nil,
-		),
-	})
+			nil, nil,
+		)
+	}
+
+	podSets = append(podSets, podSet)
 
 	return podSets
 }

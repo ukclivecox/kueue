@@ -1,11 +1,11 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package provisioning
 
 import (
@@ -43,7 +44,6 @@ import (
 
 const (
 	customResourceOne = "example.org/res1"
-	customResourceTwo = "example.org/res2"
 )
 
 var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure, func() {
@@ -84,12 +84,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 		)
 
 		ginkgo.JustBeforeEach(func() {
-			ns = &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "provisioning-",
-				},
-			}
-			gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+			ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "provisioning-")
 
 			prc = baseConfigWithParameters.Clone().RetryLimit(0).Obj()
 			gomega.Expect(k8sClient.Create(ctx, prc)).To(gomega.Succeed())
@@ -232,7 +227,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 					"ValidUntilSeconds": "0",
 				}))
 				gomega.Expect(createdRequest.Spec.PodSets).To(gomega.HaveLen(2))
-				gomega.Expect(createdRequest.ObjectMeta.GetLabels()).To(gomega.BeComparableTo(map[string]string{constants.ManagedByKueueLabel: "true"}))
+				gomega.Expect(createdRequest.ObjectMeta.GetLabels()).To(gomega.BeComparableTo(map[string]string{constants.ManagedByKueueLabelKey: constants.ManagedByKueueLabelValue}))
 
 				ps1 := createdRequest.Spec.PodSets[0]
 				gomega.Expect(ps1.Count).To(gomega.Equal(int32(3)))
@@ -249,7 +244,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 				gomega.Expect(createdTemplate.Template.Spec.Containers).To(gomega.BeComparableTo(updatedWl.Spec.PodSets[0].Template.Spec.Containers, ignoreContainersDefaults))
 				gomega.Expect(createdTemplate.Template.Spec.NodeSelector).To(gomega.BeComparableTo(map[string]string{"ns1": "ns1v"}))
-				gomega.Expect(createdTemplate.ObjectMeta.GetLabels()).To(gomega.BeComparableTo(map[string]string{constants.ManagedByKueueLabel: "true"}))
+				gomega.Expect(createdTemplate.ObjectMeta.GetLabels()).To(gomega.BeComparableTo(map[string]string{constants.ManagedByKueueLabelKey: constants.ManagedByKueueLabelValue}))
 
 				ps2 := createdRequest.Spec.PodSets[1]
 				gomega.Expect(ps2.Count).To(gomega.Equal(int32(4)))
@@ -262,7 +257,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 				gomega.Expect(createdTemplate.Template.Spec.Containers).To(gomega.BeComparableTo(updatedWl.Spec.PodSets[1].Template.Spec.Containers, ignoreContainersDefaults))
 				gomega.Expect(createdTemplate.Template.Spec.NodeSelector).To(gomega.BeComparableTo(map[string]string{"ns1": "ns1v"}))
-				gomega.Expect(createdTemplate.ObjectMeta.GetLabels()).To(gomega.BeComparableTo(map[string]string{constants.ManagedByKueueLabel: "true"}))
+				gomega.Expect(createdTemplate.ObjectMeta.GetLabels()).To(gomega.BeComparableTo(map[string]string{constants.ManagedByKueueLabelKey: constants.ManagedByKueueLabelValue}))
 			})
 
 			ginkgo.By("Removing the quota reservation from the workload", func() {
@@ -921,12 +916,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.KeepQuotaForProvReqRetry, true)
 			})
 
-			ns = &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "provisioning-",
-				},
-			}
-			gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+			ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "provisioning-")
 
 			prc = baseConfigWithParameters.Clone().RetryLimit(0).Obj()
 
@@ -1154,12 +1144,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.KeepQuotaForProvReqRetry, true)
 			})
 
-			ns = &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "provisioning-",
-				},
-			}
-			gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+			ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "provisioning-")
 			prc = baseConfigWithParameters.Clone().RetryLimit(1).BaseBackoff(1).Obj()
 			gomega.Expect(k8sClient.Create(ctx, prc)).To(gomega.Succeed())
 
@@ -1504,12 +1489,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 			updatedWl      kueue.Workload
 		)
 		ginkgo.JustBeforeEach(func() {
-			ns = &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "provisioning-",
-				},
-			}
-			gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+			ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "provisioning-")
 			prc = baseConfig.Clone().RetryLimit(1).BaseBackoff(2).Obj()
 			gomega.Expect(k8sClient.Create(ctx, prc)).To(gomega.Succeed())
 
@@ -1656,9 +1636,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, wlKey, &updatedWl)).To(gomega.Succeed())
-					cond := apimeta.FindStatusCondition(updatedWl.Status.Conditions, kueue.WorkloadRequeued)
-					g.Expect(cond).ToNot(gomega.BeNil())
-					g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+					g.Expect(updatedWl.Status.Conditions).To(testing.HaveConditionStatusTrue(kueue.WorkloadRequeued))
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 			})
 
@@ -1771,9 +1749,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, wlKey, &updatedWl)).To(gomega.Succeed())
-					cond := apimeta.FindStatusCondition(updatedWl.Status.Conditions, kueue.WorkloadRequeued)
-					g.Expect(cond).ToNot(gomega.BeNil())
-					g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+					g.Expect(updatedWl.Status.Conditions).To(testing.HaveConditionStatusTrue(kueue.WorkloadRequeued))
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 			})
 
@@ -1907,9 +1883,7 @@ var _ = ginkgo.Describe("Provisioning", ginkgo.Ordered, ginkgo.ContinueOnFailure
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 				gomega.Eventually(func(g gomega.Gomega) {
 					g.Expect(k8sClient.Get(ctx, wlKey, &updatedWl)).To(gomega.Succeed())
-					cond := apimeta.FindStatusCondition(updatedWl.Status.Conditions, kueue.WorkloadRequeued)
-					g.Expect(cond).ToNot(gomega.BeNil())
-					g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue))
+					g.Expect(updatedWl.Status.Conditions).To(testing.HaveConditionStatusTrue(kueue.WorkloadRequeued))
 				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 			})
 

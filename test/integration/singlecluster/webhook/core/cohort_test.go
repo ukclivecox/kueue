@@ -1,9 +1,12 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
+
     http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,7 +21,9 @@ import (
 	"github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
@@ -318,36 +323,57 @@ var _ = ginkgo.Describe("Cohort Webhook", func() {
 					).
 					Obj(),
 				testing.BeForbiddenError()),
+			ginkgo.Entry("Should allow FairSharing weight",
+				testing.MakeCohort("cohort").FairWeight(resource.MustParse("1")).Obj(),
+				gomega.Succeed()),
+			ginkgo.Entry("Should allow zero FareSharing weight",
+				testing.MakeCohort("cohort").FairWeight(resource.MustParse("0")).Obj(),
+				gomega.Succeed()),
+			ginkgo.Entry("Should forbid negative FareSharing weight",
+				testing.MakeCohort("cohort").FairWeight(resource.MustParse("-1")).Obj(),
+				testing.BeForbiddenError()),
+			ginkgo.Entry("Should allow fractional FareSharing weight",
+				testing.MakeCohort("cohort").FairWeight(resource.MustParse("0.5")).Obj(),
+				gomega.Succeed()),
 		)
 	})
 
 	ginkgo.When("Updating a Cohort", func() {
+		var (
+			cohort *kueuealpha.Cohort
+		)
+
+		ginkgo.AfterEach(func() {
+			util.ExpectObjectToBeDeleted(ctx, k8sClient, cohort, true)
+		})
+
 		ginkgo.It("Should update parent", func() {
-			cohort := testing.MakeCohort("cohort").Obj()
+			cohort = testing.MakeCohort("cohort").Obj()
 			gomega.Expect(k8sClient.Create(ctx, cohort)).Should(gomega.Succeed())
 
-			updated := cohort.DeepCopy()
-			updated.Spec.Parent = "cohort2"
-
-			gomega.Expect(k8sClient.Update(ctx, updated)).Should(gomega.Succeed())
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, cohort, true)
+			gomega.Eventually(func(g gomega.Gomega) {
+				createCohort := &kueuealpha.Cohort{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cohort), createCohort)).Should(gomega.Succeed())
+				createCohort.Spec.Parent = "cohort2"
+				g.Expect(k8sClient.Update(ctx, createCohort)).Should(gomega.Succeed())
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
 		})
 		ginkgo.It("Should reject invalid parent", func() {
-			cohort := testing.MakeCohort("cohort").Obj()
+			cohort = testing.MakeCohort("cohort").Obj()
 			gomega.Expect(k8sClient.Create(ctx, cohort)).Should(gomega.Succeed())
 
-			updated := cohort.DeepCopy()
-			updated.Spec.Parent = "@cohort2"
-
-			gomega.Expect(k8sClient.Update(ctx, updated)).ShouldNot(gomega.Succeed())
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, cohort, true)
+			gomega.Eventually(func(g gomega.Gomega) {
+				createCohort := &kueuealpha.Cohort{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cohort), createCohort)).Should(gomega.Succeed())
+				createCohort.Spec.Parent = "@cohort2"
+				gomega.Expect(k8sClient.Update(ctx, createCohort)).ShouldNot(gomega.Succeed())
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
 		})
 		ginkgo.It("Should reject negative borrowing limit", func() {
-			cohort := testing.MakeCohort("cohort").
-				ResourceGroup(testing.MakeFlavorQuotas("x86").Resource("cpu", "-1").FlavorQuotas).Cohort
-
-			gomega.Expect(k8sClient.Create(ctx, &cohort)).ShouldNot(gomega.Succeed())
-			util.ExpectObjectToBeDeleted(ctx, k8sClient, &cohort, true)
+			cohort = testing.MakeCohort("cohort").
+				ResourceGroup(*testing.MakeFlavorQuotas("x86").Resource("cpu", "-1").Obj()).
+				Obj()
+			gomega.Expect(k8sClient.Create(ctx, cohort)).ShouldNot(gomega.Succeed())
 		})
 	})
 })

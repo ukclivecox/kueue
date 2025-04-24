@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -63,6 +63,7 @@ import (
 
 const (
 	FailedToStartFinishedReason = "FailedToStart"
+	managedOwnersChainLimit     = 10
 )
 
 var (
@@ -70,7 +71,7 @@ var (
 	ErrWorkloadOwnerNotFound    = errors.New("workload owner not found")
 	ErrNoMatchingWorkloads      = errors.New("no matching workloads")
 	ErrExtraWorkloads           = errors.New("extra workloads")
-	ErrPrebuildWorkloadNotFound = errors.New("prebuild workload not found")
+	ErrPrebuiltWorkloadNotFound = errors.New("prebuilt workload not found")
 )
 
 // JobReconciler reconciles a GenericJob object
@@ -304,7 +305,7 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 			log.V(3).Info("queue-name label is not set, ignoring the job", "queueName", QueueName(job))
 			return ctrl.Result{}, nil
 		}
-		isAncestorJobManaged, err := r.IsAncestorJobManaged(ctx, job.Object(), req.Namespace)
+		isAncestorJobManaged, err := r.IsAncestorJobManaged(ctx, job.Object())
 		if err != nil {
 			log.Error(err, "couldn't check whether an ancestor job is managed by kueue")
 			return ctrl.Result{}, err
@@ -320,7 +321,7 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 	if !isTopLevelJob {
 		_, _, finished := job.Finished()
 		if !finished && !job.IsSuspended() {
-			if ancestorWorkload, err := r.getAncestorWorkload(ctx, object, req.Namespace); err != nil {
+			if ancestorWorkload, err := r.getAncestorWorkload(ctx, object); err != nil {
 				log.Error(err, "couldn't get an ancestor job workload")
 				return ctrl.Result{}, err
 			} else if ancestorWorkload == nil || !workload.IsAdmitted(ancestorWorkload) {
@@ -459,15 +460,17 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 	// handle a job when waitForPodsReady is enabled, and it is the main job
 	if r.waitForPodsReady {
 		log.V(3).Info("Handling a job when waitForPodsReady is enabled")
-		condition := generatePodsReadyCondition(job, wl)
-		// optimization to avoid sending the update request if the status didn't change
-		if !apimeta.IsStatusConditionPresentAndEqual(wl.Status.Conditions, condition.Type, condition.Status) {
-			log.V(3).Info(fmt.Sprintf("Updating the PodsReady condition with status: %v", condition.Status))
+		condition := generatePodsReadyCondition(log, job, wl)
+		if !workload.HasConditionWithTypeAndReason(wl, &condition) {
+			log.V(3).Info("Updating the PodsReady condition", "reason", condition.Reason, "status", condition.Status)
 			apimeta.SetStatusCondition(&wl.Status.Conditions, condition)
 			err := workload.UpdateStatus(ctx, r.client, wl, condition.Type, condition.Status, condition.Reason, condition.Message, constants.JobControllerName, r.clock)
 			if err != nil {
 				log.Error(err, "Updating workload status")
 			}
+			return ctrl.Result{}, nil
+		} else {
+			log.V(3).Info("No update for PodsReady condition")
 		}
 	}
 
@@ -570,8 +573,8 @@ func (r *JobReconciler) recordAdmissionCheckUpdate(wl *kueue.Workload, job Gener
 }
 
 // IsAncestorJobManaged checks whether an ancestor job is managed by kueue.
-func (r *JobReconciler) IsAncestorJobManaged(ctx context.Context, jobObj client.Object, namespace string) (bool, error) {
-	ancestor, err := r.getAncestorJobManagedByKueue(ctx, jobObj, namespace)
+func (r *JobReconciler) IsAncestorJobManaged(ctx context.Context, jobObj client.Object) (bool, error) {
+	ancestor, err := r.getAncestorJobManagedByKueue(ctx, jobObj)
 	if err != nil {
 		return false, err
 	}
@@ -579,13 +582,10 @@ func (r *JobReconciler) IsAncestorJobManaged(ctx context.Context, jobObj client.
 }
 
 // getAncestorWorkload returns the Workload object of the Kueue-managed ancestor job.
-func (r *JobReconciler) getAncestorWorkload(ctx context.Context, jobObj client.Object, namespace string) (*kueue.Workload, error) {
-	ancestor, err := r.getAncestorJobManagedByKueue(ctx, jobObj, namespace)
-	if err != nil {
+func (r *JobReconciler) getAncestorWorkload(ctx context.Context, jobObj client.Object) (*kueue.Workload, error) {
+	ancestor, err := r.getAncestorJobManagedByKueue(ctx, jobObj)
+	if err != nil || ancestor == nil {
 		return nil, err
-	}
-	if ancestor == nil {
-		return nil, nil
 	}
 	wlList := kueue.WorkloadList{}
 	if err := r.client.List(ctx, &wlList, client.InNamespace(ancestor.GetNamespace()), client.MatchingFields{indexer.OwnerReferenceUID: string(ancestor.GetUID())}); client.IgnoreNotFound(err) != nil {
@@ -599,15 +599,16 @@ func (r *JobReconciler) getAncestorWorkload(ctx context.Context, jobObj client.O
 }
 
 // getAncestorJobManagedByKueue traverses controllerRefs to find an ancestor job that is manged by Kueue (ie, it has a queue-name label).
-func (r *JobReconciler) getAncestorJobManagedByKueue(ctx context.Context, jobObj client.Object, namespace string) (client.Object, error) {
-	seen := make(sets.Set[types.UID])
+func (r *JobReconciler) getAncestorJobManagedByKueue(ctx context.Context, jobObj client.Object) (client.Object, error) {
+	seen := sets.New[types.UID]()
+	currentJob := jobObj
 	for {
-		if seen.Has(jobObj.GetUID()) {
+		if seen.Has(currentJob.GetUID()) {
 			return nil, nil
 		}
-		seen.Insert(jobObj.GetUID())
+		seen.Insert(currentJob.GetUID())
 
-		owner := metav1.GetControllerOf(jobObj)
+		owner := metav1.GetControllerOf(currentJob)
 		if owner == nil || !IsOwnerManagedByKueue(owner) {
 			return nil, nil
 		}
@@ -615,13 +616,23 @@ func (r *JobReconciler) getAncestorJobManagedByKueue(ctx context.Context, jobObj
 		if parentJob == nil {
 			return nil, fmt.Errorf("workload owner %v: %w", owner, ErrUnknownWorkloadOwner)
 		}
-		if err := r.client.Get(ctx, client.ObjectKey{Name: owner.Name, Namespace: namespace}, parentJob); err != nil {
+		if err := r.client.Get(ctx, client.ObjectKey{Name: owner.Name, Namespace: jobObj.GetNamespace()}, parentJob); err != nil {
 			return nil, errors.Join(ErrWorkloadOwnerNotFound, err)
 		}
 		if QueueNameForObject(parentJob) != "" {
 			return parentJob, nil
 		}
-		jobObj = parentJob
+		currentJob = parentJob
+		if len(seen) > managedOwnersChainLimit {
+			r.record.Eventf(jobObj, corev1.EventTypeWarning, ReasonJobNestingTooDeep,
+				"Terminated search for Kueue-managed Job because ancestor depth exceeded limit of %d", managedOwnersChainLimit)
+			ctrl.LoggerFrom(ctx).V(2).Info(
+				"Terminated search for Kueue-managed Job because ancestor depth exceeded managedOwnersChainlimit",
+				"limit ", managedOwnersChainLimit,
+				"lastParentReached", parentJob,
+			)
+			return nil, nil
+		}
 	}
 }
 
@@ -825,7 +836,7 @@ func expectedRunningPodSets(ctx context.Context, c client.Client, wl *kueue.Work
 	if err != nil {
 		return nil
 	}
-	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) string { return psi.Name })
+	infoMap := slices.ToRefMap(info, func(psi *podset.PodSetInfo) kueue.PodSetReference { return psi.Name })
 	runningPodSets := wl.Spec.DeepCopy().PodSets
 	canBePartiallyAdmitted := workload.CanBePartiallyAdmitted(wl)
 	for i := range runningPodSets {
@@ -1040,15 +1051,21 @@ func (r *JobReconciler) prepareWorkload(ctx context.Context, job GenericJob, wl 
 }
 
 func (r *JobReconciler) extractPriority(ctx context.Context, podSets []kueue.PodSet, job GenericJob) (string, string, int32, error) {
-	if workloadPriorityClass := WorkloadPriorityClassName(job.Object()); len(workloadPriorityClass) > 0 {
-		return utilpriority.GetPriorityFromWorkloadPriorityClass(ctx, r.client, workloadPriorityClass)
-	}
+	var customPriorityFunc func() string
 	if jobWithPriorityClass, isImplemented := job.(JobWithPriorityClass); isImplemented {
-		return utilpriority.GetPriorityFromPriorityClass(
-			ctx, r.client, jobWithPriorityClass.PriorityClass())
+		customPriorityFunc = jobWithPriorityClass.PriorityClass
 	}
-	return utilpriority.GetPriorityFromPriorityClass(
-		ctx, r.client, extractPriorityFromPodSets(podSets))
+	return ExtractPriority(ctx, r.client, job.Object(), podSets, customPriorityFunc)
+}
+
+func ExtractPriority(ctx context.Context, c client.Client, obj client.Object, podSets []kueue.PodSet, customPriorityFunc func() string) (string, string, int32, error) {
+	if workloadPriorityClass := WorkloadPriorityClassName(obj); len(workloadPriorityClass) > 0 {
+		return utilpriority.GetPriorityFromWorkloadPriorityClass(ctx, c, workloadPriorityClass)
+	}
+	if customPriorityFunc != nil {
+		return utilpriority.GetPriorityFromPriorityClass(ctx, c, customPriorityFunc())
+	}
+	return utilpriority.GetPriorityFromPriorityClass(ctx, c, extractPriorityFromPodSets(podSets))
 }
 
 func extractPriorityFromPodSets(podSets []kueue.PodSet) string {
@@ -1069,13 +1086,13 @@ func getPodSetsInfoFromStatus(ctx context.Context, c client.Client, w *kueue.Wor
 
 	podSetsInfo := make([]podset.PodSetInfo, len(w.Status.Admission.PodSetAssignments))
 
-	for i, podSetFlavor := range w.Status.Admission.PodSetAssignments {
-		info, err := podset.FromAssignment(ctx, c, &podSetFlavor, w.Spec.PodSets[i].Count)
+	for i, psAssignment := range w.Status.Admission.PodSetAssignments {
+		info, err := podset.FromAssignment(ctx, c, &psAssignment, w.Spec.PodSets[i].Count)
 		if err != nil {
 			return nil, err
 		}
 		if features.Enabled(features.TopologyAwareScheduling) {
-			info.Labels[kueuealpha.PodSetLabel] = podSetFlavor.Name
+			info.Labels[kueuealpha.PodSetLabel] = string(psAssignment.Name)
 			info.Annotations[kueuealpha.WorkloadAnnotation] = w.Name
 		}
 		for _, admissionCheck := range w.Status.AdmissionChecks {
@@ -1111,7 +1128,7 @@ func (r *JobReconciler) handleJobWithNoWorkload(ctx context.Context, job Generic
 	}
 
 	if usePrebuiltWorkload {
-		return ErrPrebuildWorkloadNotFound
+		return ErrPrebuiltWorkloadNotFound
 	}
 
 	// Create the corresponding workload.
@@ -1139,24 +1156,57 @@ func (r *JobReconciler) ignoreUnretryableError(log logr.Logger, err error) error
 	return err
 }
 
-func generatePodsReadyCondition(job GenericJob, wl *kueue.Workload) metav1.Condition {
-	conditionStatus := metav1.ConditionFalse
-	message := "Not all pods are ready or succeeded"
-	// Once PodsReady=True it stays as long as the workload remains admitted to
-	// avoid unnecessary flickering the condition when the pods transition
-	// from Ready to Completed. As pods finish, they transition first into the
-	// uncountedTerminatedPods staging area, before passing to the
-	// succeeded/failed counters.
-	if workload.IsAdmitted(wl) && (job.PodsReady() || apimeta.IsStatusConditionTrue(wl.Status.Conditions, kueue.WorkloadPodsReady)) {
-		conditionStatus = metav1.ConditionTrue
-		message = "All pods were ready or succeeded since the workload admission"
+func generatePodsReadyCondition(log logr.Logger, job GenericJob, wl *kueue.Workload) metav1.Condition {
+	const (
+		notReadyMsg           = "Not all pods are ready or succeeded"
+		waitingForRecoveryMsg = "At least one pod has failed, waiting for recovery"
+		readyMsg              = "All pods reached readiness and the workload is running"
+	)
+	if !workload.IsAdmitted(wl) {
+		// The workload has not been admitted yet
+		// or it was admitted in the past but it's evicted/requeued
+		return workload.CreatePodsReadyCondition(metav1.ConditionFalse,
+			kueue.WorkloadWaitForStart,
+			notReadyMsg)
 	}
-	return metav1.Condition{
-		Type:    kueue.WorkloadPodsReady,
-		Status:  conditionStatus,
-		Reason:  "PodsReady",
-		Message: message,
-		// ObservedGeneration is added via workload.UpdateStatus
+
+	podsReadyCond := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadPodsReady)
+	podsReady := job.PodsReady()
+	log.V(3).Info("Generating PodsReady condition",
+		"Current PodsReady condition", podsReadyCond,
+		"Pods are ready", podsReady)
+
+	if podsReady {
+		reason := kueue.WorkloadStarted
+		if podsReadyCond != nil && (podsReadyCond.Reason == kueue.WorkloadWaitForRecovery || podsReadyCond.Reason == kueue.WorkloadRecovered) {
+			reason = kueue.WorkloadRecovered
+		}
+		return workload.CreatePodsReadyCondition(metav1.ConditionTrue,
+			reason,
+			readyMsg)
+	}
+
+	switch {
+	case podsReadyCond == nil:
+		return workload.CreatePodsReadyCondition(metav1.ConditionFalse,
+			kueue.WorkloadWaitForStart,
+			notReadyMsg)
+
+	case podsReadyCond.Status == metav1.ConditionTrue:
+		return workload.CreatePodsReadyCondition(metav1.ConditionFalse,
+			kueue.WorkloadWaitForRecovery,
+			waitingForRecoveryMsg)
+
+	case podsReadyCond.Reason == kueue.WorkloadWaitForRecovery:
+		return workload.CreatePodsReadyCondition(metav1.ConditionFalse,
+			kueue.WorkloadWaitForRecovery,
+			waitingForRecoveryMsg)
+
+	default:
+		// handles both "WaitForPodsStart" and the old "PodsReady" reasons
+		return workload.CreatePodsReadyCondition(metav1.ConditionFalse,
+			kueue.WorkloadWaitForStart,
+			notReadyMsg)
 	}
 }
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,14 +21,12 @@ import (
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	configapi "sigs.k8s.io/kueue/apis/config/v1beta1"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
-	"sigs.k8s.io/kueue/pkg/controller/jobs/pod"
+	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobs/statefulset"
 	"sigs.k8s.io/kueue/pkg/util/kubeversion"
 	testingstatefulset "sigs.k8s.io/kueue/pkg/util/testingjobs/statefulset"
@@ -50,22 +48,13 @@ var _ = ginkgo.Describe("StatefulSet Webhook", func() {
 				statefulset.SetupWebhook,
 				jobframework.WithManageJobsWithoutQueueName(false),
 				jobframework.WithKubeServerVersion(serverVersionFetcher),
-				jobframework.WithIntegrationOptions(
-					corev1.SchemeGroupVersion.WithKind("Pod").String(),
-					&configapi.PodIntegrationOptions{},
-				),
 			))
 		})
 		ginkgo.AfterAll(func() {
 			fwk.StopManager(ctx)
 		})
 		ginkgo.BeforeEach(func() {
-			ns = &corev1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: "statefulset-",
-				},
-			}
-			gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+			ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "statefulset-")
 		})
 		ginkgo.AfterEach(func() {
 			gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
@@ -84,12 +73,12 @@ var _ = ginkgo.Describe("StatefulSet Webhook", func() {
 							gomega.Equal("user-queue"),
 							"Queue name should be injected to pod template labels",
 						)
-					g.Expect(createdStatefulSet.Spec.Template.Labels[pod.GroupNameLabel]).
+					g.Expect(createdStatefulSet.Spec.Template.Labels[podconstants.GroupNameLabel]).
 						To(
 							gomega.Equal(jobframework.GetWorkloadNameForOwnerWithGVK(createdStatefulSet.Name, "", appsv1.SchemeGroupVersion.WithKind("StatefulSet"))),
 							"Pod group name should be injected to pod template labels",
 						)
-					g.Expect(createdStatefulSet.Spec.Template.Annotations[pod.GroupTotalCountAnnotation]).
+					g.Expect(createdStatefulSet.Spec.Template.Annotations[podconstants.GroupTotalCountAnnotation]).
 						To(
 							gomega.Equal("1"),
 							"Pod group total count should be injected to pod template annotations",

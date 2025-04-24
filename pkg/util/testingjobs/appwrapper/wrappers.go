@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -152,7 +152,7 @@ func (aw *AppWrapperWrapper) Suspend(s bool) *AppWrapperWrapper {
 	return aw
 }
 
-// StatusCondition sets a status condition of the AppWrapper.
+// SetCondition sets a status condition of the AppWrapper.
 func (aw *AppWrapperWrapper) SetCondition(condition metav1.Condition) *AppWrapperWrapper {
 	meta.SetStatusCondition(&aw.Status.Conditions, condition)
 	return aw

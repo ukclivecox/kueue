@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -58,8 +58,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 	)
 
 	ginkgo.BeforeEach(func() {
-		ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "e2e-metrics-"}}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "e2e-metrics-")
 
 		resourceFlavor = utiltesting.MakeResourceFlavor("test-flavor").Obj()
 		gomega.Expect(k8sClient.Create(ctx, resourceFlavor)).To(gomega.Succeed())
@@ -83,9 +82,8 @@ var _ = ginkgo.Describe("Metrics", func() {
 
 		curlPod = testingjobspod.MakePod("curl-metrics", config.DefaultNamespace).
 			ServiceAccountName(serviceAccountName).
-			Image(util.E2eTTestCurlImage, []string{
-				"sleep", "5m",
-			}).
+			Image(util.E2eTestAgnHostImage, util.BehaviorWaitForDeletion).
+			TerminationGracePeriod(1).
 			Obj()
 		gomega.Expect(k8sClient.Create(ctx, curlPod)).Should(gomega.Succeed())
 
@@ -102,11 +100,10 @@ var _ = ginkgo.Describe("Metrics", func() {
 
 	ginkgo.AfterEach(func() {
 		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
-
 		util.ExpectObjectToBeDeleted(ctx, k8sClient, resourceFlavor, true)
-
 		util.ExpectObjectToBeDeleted(ctx, k8sClient, metricsReaderClusterRoleBinding, true)
 		util.ExpectObjectToBeDeletedWithTimeout(ctx, k8sClient, curlPod, true, util.LongTimeout)
+		util.ExpectAllPodsInNamespaceDeleted(ctx, k8sClient, ns)
 	})
 
 	ginkgo.When("workload is admitted", func() {
@@ -139,7 +136,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 				PodSets(
 					*utiltesting.MakePodSet("ps1", 1).Obj(),
 				).
-				Request(corev1.ResourceCPU, "1").
+				RequestAndLimit(corev1.ResourceCPU, "1").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, workload)).To(gomega.Succeed())
 		})
@@ -271,7 +268,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 
 			createdJob = testingjob.MakeJob("admission-checked-job", ns.Name).
 				Queue(localQueue.Name).
-				Request("cpu", "1").
+				RequestAndLimit("cpu", "1").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, createdJob)).To(gomega.Succeed())
 
@@ -371,7 +368,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 						Obj(),
 				).
 				Preemption(v1beta1.ClusterQueuePreemption{
-					ReclaimWithinCohort: v1beta1.PreemptionPolicyAny,
+					ReclaimWithinCohort: v1beta1.PreemptionPolicyLowerPriority,
 					WithinClusterQueue:  v1beta1.PreemptionPolicyLowerPriority,
 					BorrowWithinCohort: &v1beta1.BorrowWithinCohort{
 						Policy: v1beta1.BorrowWithinCohortPolicyLowerPriority,
@@ -389,7 +386,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 						Obj(),
 				).
 				Preemption(v1beta1.ClusterQueuePreemption{
-					ReclaimWithinCohort: v1beta1.PreemptionPolicyAny,
+					ReclaimWithinCohort: v1beta1.PreemptionPolicyLowerPriority,
 					WithinClusterQueue:  v1beta1.PreemptionPolicyLowerPriority,
 					BorrowWithinCohort: &v1beta1.BorrowWithinCohort{
 						Policy: v1beta1.BorrowWithinCohortPolicyLowerPriority,
@@ -415,7 +412,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 
 			lowerJob1 = testingjob.MakeJob("lower-job-1", ns.Name).
 				Queue(localQueue1.Name).
-				Request("cpu", "1").
+				RequestAndLimit("cpu", "1").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, lowerJob1)).To(gomega.Succeed())
 
@@ -434,7 +431,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 
 			lowerJob2 = testingjob.MakeJob("lower-job-2", ns.Name).
 				Queue(localQueue1.Name).
-				Request("cpu", "1").
+				RequestAndLimit("cpu", "1").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, lowerJob2)).To(gomega.Succeed())
 
@@ -454,7 +451,7 @@ var _ = ginkgo.Describe("Metrics", func() {
 			blockerJob = testingjob.MakeJob("blocker", ns.Name).
 				Queue(localQueue2.Name).
 				PriorityClass(highPriorityClass.Name).
-				Request(corev1.ResourceCPU, "3").
+				RequestAndLimit(corev1.ResourceCPU, "3").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, blockerJob)).Should(gomega.Succeed())
 
@@ -474,14 +471,14 @@ var _ = ginkgo.Describe("Metrics", func() {
 			higherJob1 = testingjob.MakeJob("high-large-1", ns.Name).
 				Queue(localQueue1.Name).
 				PriorityClass(highPriorityClass.Name).
-				Request(corev1.ResourceCPU, "4").
+				RequestAndLimit(corev1.ResourceCPU, "4").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, higherJob1)).Should(gomega.Succeed())
 
 			higherJob2 = testingjob.MakeJob("high-large-2", ns.Name).
 				Queue(localQueue2.Name).
 				PriorityClass(highPriorityClass.Name).
-				Request(corev1.ResourceCPU, "4").
+				RequestAndLimit(corev1.ResourceCPU, "4").
 				Obj()
 			gomega.Expect(k8sClient.Create(ctx, higherJob2)).Should(gomega.Succeed())
 		})

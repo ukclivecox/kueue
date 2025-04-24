@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	kfmpi "github.com/kubeflow/mpi-operator/pkg/apis/kubeflow/v2beta1"
@@ -68,12 +67,8 @@ type Framework struct {
 	managerDone   <-chan struct{}
 }
 
-var setupLogger = sync.OnceFunc(func() {
-	ctrl.SetLogger(util.NewTestingLogger(ginkgo.GinkgoWriter, -3))
-})
-
 func (f *Framework) Init() *rest.Config {
-	setupLogger()
+	util.SetupLogger()
 
 	var cfg *rest.Config
 	ginkgo.By("bootstrapping test environment", func() {

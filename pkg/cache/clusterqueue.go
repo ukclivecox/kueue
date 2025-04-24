@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,13 +43,12 @@ import (
 
 var (
 	errQueueAlreadyExists = errors.New("queue already exists")
-	oneQuantity           = resource.MustParse("1")
 )
 
 // clusterQueue is the internal implementation of kueue.clusterQueue that
 // holds admitted workloads.
 type clusterQueue struct {
-	Name              string
+	Name              kueue.ClusterQueueReference
 	ResourceGroups    []ResourceGroup
 	Workloads         map[string]*workload.Info
 	WorkloadsNotReady sets.Set[string]
@@ -89,7 +88,7 @@ type clusterQueue struct {
 	tasCache *TASCache
 }
 
-func (c *clusterQueue) GetName() string {
+func (c *clusterQueue) GetName() kueue.ClusterQueueReference {
 	return c.Name
 }
 
@@ -122,15 +121,15 @@ var defaultPreemption = kueue.ClusterQueuePreemption{
 
 var defaultFlavorFungibility = kueue.FlavorFungibility{WhenCanBorrow: kueue.Borrow, WhenCanPreempt: kueue.TryNextFlavor}
 
-func (c *clusterQueue) updateClusterQueue(cycleChecker hierarchy.CycleChecker, in *kueue.ClusterQueue, resourceFlavors map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor, admissionChecks map[string]AdmissionCheck, oldParent *cohort) error {
+func (c *clusterQueue) updateClusterQueue(in *kueue.ClusterQueue, resourceFlavors map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor, admissionChecks map[string]AdmissionCheck, oldParent *cohort) error {
 	if c.updateQuotasAndResourceGroups(in.Spec.ResourceGroups) || oldParent != c.Parent() {
 		if oldParent != nil && oldParent != c.Parent() {
 			// ignore error when old Cohort has cycle.
-			_ = updateCohortTreeResources(oldParent, cycleChecker)
+			_ = updateCohortTreeResources(oldParent)
 		}
 		if c.HasParent() {
 			// clusterQueue will be updated as part of tree update.
-			if err := updateCohortTreeResources(c.Parent(), cycleChecker); err != nil {
+			if err := updateCohortTreeResources(c.Parent()); err != nil {
 				return err
 			}
 		} else {
@@ -171,10 +170,7 @@ func (c *clusterQueue) updateClusterQueue(cycleChecker hierarchy.CycleChecker, i
 		c.FlavorFungibility = defaultFlavorFungibility
 	}
 
-	c.FairWeight = oneQuantity
-	if fs := in.Spec.FairSharing; fs != nil && fs.Weight != nil {
-		c.FairWeight = *fs.Weight
-	}
+	c.FairWeight = parseFairWeight(in.Spec.FairSharing)
 
 	return nil
 }
@@ -278,14 +274,6 @@ func (c *clusterQueue) inactiveReason() (string, string) {
 		}
 
 		if features.Enabled(features.TopologyAwareScheduling) && len(c.tasFlavors) > 0 {
-			if c.HasParent() {
-				reasons = append(reasons, kueue.ClusterQueueActiveReasonNotSupportedWithTopologyAwareScheduling)
-				messages = append(messages, "TAS is not supported for cohorts")
-			}
-			if c.Preemption.WithinClusterQueue != kueue.PreemptionPolicyNever {
-				reasons = append(reasons, kueue.ClusterQueueActiveReasonNotSupportedWithTopologyAwareScheduling)
-				messages = append(messages, "TAS is not supported for preemption within cluster queue")
-			}
 			if len(c.multiKueueAdmissionChecks) > 0 {
 				reasons = append(reasons, kueue.ClusterQueueActiveReasonNotSupportedWithTopologyAwareScheduling)
 				messages = append(messages, "TAS is not supported with MultiKueue admission check")
@@ -320,10 +308,7 @@ func (c *clusterQueue) isTASViolated() bool {
 			return true
 		}
 	}
-	return c.HasParent() ||
-		c.Preemption.WithinClusterQueue != kueue.PreemptionPolicyNever ||
-		len(c.multiKueueAdmissionChecks) > 0 ||
-		len(c.provisioningAdmissionChecks) > 0
+	return len(c.multiKueueAdmissionChecks) > 0 || len(c.provisioningAdmissionChecks) > 0
 }
 
 // UpdateWithFlavors updates a ClusterQueue based on the passed ResourceFlavors set.
@@ -500,8 +485,8 @@ func (c *clusterQueue) deleteWorkload(w *kueue.Workload) {
 }
 
 func (c *clusterQueue) reportActiveWorkloads() {
-	metrics.AdmittedActiveWorkloads.WithLabelValues(c.Name).Set(float64(c.admittedWorkloadsCount))
-	metrics.ReservingActiveWorkloads.WithLabelValues(c.Name).Set(float64(len(c.Workloads)))
+	metrics.AdmittedActiveWorkloads.WithLabelValues(string(c.Name)).Set(float64(c.admittedWorkloadsCount))
+	metrics.ReservingActiveWorkloads.WithLabelValues(string(c.Name)).Set(float64(len(c.Workloads)))
 }
 
 func (q *queue) reportActiveWorkloads() {
@@ -641,4 +626,15 @@ func workloadBelongsToLocalQueue(wl *kueue.Workload, q *kueue.LocalQueue) bool {
 
 func (c *clusterQueue) fairWeight() *resource.Quantity {
 	return &c.FairWeight
+}
+
+func (c *clusterQueue) isTASOnly() bool {
+	for _, rg := range c.ResourceGroups {
+		for _, fName := range rg.Flavors {
+			if _, found := c.tasFlavors[fName]; !found {
+				return false
+			}
+		}
+	}
+	return true
 }

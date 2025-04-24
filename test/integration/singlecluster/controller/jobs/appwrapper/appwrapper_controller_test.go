@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	awv1beta2 "github.com/project-codeflare/appwrapper/api/v1beta2"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -62,11 +63,7 @@ var _ = ginkgo.Describe("AppWrapper controller", ginkgo.Ordered, ginkgo.Continue
 	ginkgo.BeforeAll(func() {
 		fwk.StartManager(ctx, cfg, managerSetup(jobframework.WithManageJobsWithoutQueueName(true),
 			jobframework.WithManagedJobsNamespaceSelector(util.NewNamespaceSelectorExcluding("unmanaged-ns"))))
-		unmanagedNamespace := &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "unmanaged-ns",
-			},
-		}
+		unmanagedNamespace := testing.MakeNamespace("unmanaged-ns")
 		gomega.Expect(k8sClient.Create(ctx, unmanagedNamespace)).To(gomega.Succeed())
 	})
 	ginkgo.AfterAll(func() {
@@ -77,12 +74,7 @@ var _ = ginkgo.Describe("AppWrapper controller", ginkgo.Ordered, ginkgo.Continue
 		ns *corev1.Namespace
 	)
 	ginkgo.BeforeEach(func() {
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "aw-",
-			},
-		}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "aw-")
 	})
 	ginkgo.AfterEach(func() {
 		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
@@ -393,7 +385,7 @@ var _ = ginkgo.Describe("AppWrapper controller", ginkgo.Ordered, ginkgo.Continue
 						State: kueue.CheckStateReady,
 						PodSetUpdates: []kueue.PodSetUpdate{
 							{
-								Name: "test-aw-0-0",
+								Name: "test-aw-0",
 								Annotations: map[string]string{
 									"ann1": "ann-value1",
 								},
@@ -413,7 +405,7 @@ var _ = ginkgo.Describe("AppWrapper controller", ginkgo.Ordered, ginkgo.Continue
 								},
 							},
 							{
-								Name: "test-aw-1-0",
+								Name: "test-aw-1",
 								Annotations: map[string]string{
 									"ann1": "ann-value2",
 								},
@@ -519,12 +511,7 @@ var _ = ginkgo.Describe("AppWrapper controller for workloads when only jobs with
 		ns *corev1.Namespace
 	)
 	ginkgo.BeforeEach(func() {
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "aw-",
-			},
-		}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "aw-")
 	})
 	ginkgo.AfterEach(func() {
 		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
@@ -590,12 +577,7 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 		ns *corev1.Namespace
 	)
 	ginkgo.BeforeEach(func() {
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "aw-",
-			},
-		}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "aw-")
 	})
 	ginkgo.AfterEach(func() {
 		gomega.Expect(util.DeleteNamespace(ctx, k8sClient, ns)).To(gomega.Succeed())
@@ -690,7 +672,7 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 			wantCondition: &metav1.Condition{
 				Type:    kueue.WorkloadPodsReady,
 				Status:  metav1.ConditionFalse,
-				Reason:  "PodsReady",
+				Reason:  kueue.WorkloadWaitForStart,
 				Message: "Not all pods are ready or succeeded",
 			},
 		}),
@@ -700,7 +682,7 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 					{
 						Type:               string(awv1beta2.PodsReady),
 						Status:             metav1.ConditionTrue,
-						Reason:             "PodsReady",
+						Reason:             kueue.WorkloadStarted,
 						LastTransitionTime: metav1.NewTime(time.Now()),
 					},
 				},
@@ -708,15 +690,15 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 			wantCondition: &metav1.Condition{
 				Type:    kueue.WorkloadPodsReady,
 				Status:  metav1.ConditionTrue,
-				Reason:  "PodsReady",
-				Message: "All pods were ready or succeeded since the workload admission",
+				Reason:  kueue.WorkloadStarted,
+				Message: "All pods reached readiness and the workload is running",
 			},
 		}),
 		ginkgo.Entry("Running AppWrapper; PodsReady=False before", podsReadyTestSpec{
 			beforeCondition: &metav1.Condition{
 				Type:    kueue.WorkloadPodsReady,
 				Status:  metav1.ConditionFalse,
-				Reason:  "PodsReady",
+				Reason:  kueue.WorkloadWaitForStart,
 				Message: "Not all pods are ready or succeeded",
 			},
 			appWrapperStatus: awv1beta2.AppWrapperStatus{
@@ -724,7 +706,7 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 					{
 						Type:               string(awv1beta2.PodsReady),
 						Status:             metav1.ConditionTrue,
-						Reason:             "PodsReady",
+						Reason:             kueue.WorkloadStarted,
 						LastTransitionTime: metav1.NewTime(time.Now()),
 					},
 				},
@@ -732,8 +714,8 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 			wantCondition: &metav1.Condition{
 				Type:    kueue.WorkloadPodsReady,
 				Status:  metav1.ConditionTrue,
-				Reason:  "PodsReady",
-				Message: "All pods were ready or succeeded since the workload admission",
+				Reason:  kueue.WorkloadStarted,
+				Message: "All pods reached readiness and the workload is running",
 			},
 		}),
 		ginkgo.Entry("AppWrapper suspended; PodsReady=True before", podsReadyTestSpec{
@@ -742,7 +724,7 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 					{
 						Type:               string(awv1beta2.PodsReady),
 						Status:             metav1.ConditionTrue,
-						Reason:             "PodsReady",
+						Reason:             kueue.WorkloadStarted,
 						LastTransitionTime: metav1.NewTime(time.Now()),
 					},
 				},
@@ -750,14 +732,14 @@ var _ = ginkgo.Describe("AppWrapper controller when waitForPodsReady enabled", g
 			beforeCondition: &metav1.Condition{
 				Type:    kueue.WorkloadPodsReady,
 				Status:  metav1.ConditionTrue,
-				Reason:  "PodsReady",
-				Message: "All pods were ready or succeeded since the workload admission",
+				Reason:  kueue.WorkloadStarted,
+				Message: "All pods reached readiness and the workload is running",
 			},
 			suspended: true,
 			wantCondition: &metav1.Condition{
 				Type:    kueue.WorkloadPodsReady,
 				Status:  metav1.ConditionFalse,
-				Reason:  "PodsReady",
+				Reason:  kueue.WorkloadWaitForStart,
 				Message: "Not all pods are ready or succeeded",
 			},
 		}),
@@ -781,12 +763,7 @@ var _ = ginkgo.Describe("AppWrapper controller interacting with scheduler", gink
 	)
 
 	ginkgo.BeforeEach(func() {
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "aw-",
-			},
-		}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "aw-")
 
 		onDemandFlavor = testing.MakeResourceFlavor("on-demand").NodeLabel(instanceKey, "on-demand").Obj()
 		gomega.Expect(k8sClient.Create(ctx, onDemandFlavor)).Should(gomega.Succeed())
@@ -866,12 +843,7 @@ var _ = ginkgo.Describe("AppWrapper controller when TopologyAwareScheduling enab
 	ginkgo.BeforeEach(func() {
 		features.SetFeatureGateDuringTest(ginkgo.GinkgoTB(), features.TopologyAwareScheduling, true)
 
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "tas-aw-",
-			},
-		}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "tas-aw-")
 
 		nodes = []corev1.Node{
 			*testingnode.MakeNode("b1").
@@ -885,7 +857,7 @@ var _ = ginkgo.Describe("AppWrapper controller when TopologyAwareScheduling enab
 				Ready().
 				Obj(),
 		}
-		util.CreateNodes(ctx, k8sClient, nodes)
+		util.CreateNodesWithStatus(ctx, k8sClient, nodes)
 
 		topology = testing.MakeTopology("default").Levels(tasBlockLabel).Obj()
 		gomega.Expect(k8sClient.Create(ctx, topology)).Should(gomega.Succeed())
@@ -939,7 +911,8 @@ var _ = ginkgo.Describe("AppWrapper controller when TopologyAwareScheduling enab
 					Name:  wl.Spec.PodSets[0].Name,
 					Count: 1,
 					TopologyRequest: &kueue.PodSetTopologyRequest{
-						Required: ptr.To(tasBlockLabel),
+						Required:      ptr.To(tasBlockLabel),
+						PodIndexLabel: ptr.To(batchv1.JobCompletionIndexAnnotation),
 					},
 				}}, cmpopts.IgnoreFields(kueue.PodSet{}, "Template")))
 			}, util.Timeout, util.Interval).Should(gomega.Succeed())

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,13 +31,14 @@ import (
 func (a *Assignment) WorkloadsTopologyRequests(wl *workload.Info, cq *cache.ClusterQueueSnapshot) cache.WorkloadTASRequests {
 	tasRequests := make(cache.WorkloadTASRequests)
 	for i, podSet := range wl.Obj.Spec.PodSets {
-		if podSet.TopologyRequest != nil {
+		if isTASRequested(&podSet, cq) {
 			psAssignment := a.podSetAssignmentByName(podSet.Name)
 			if psAssignment.Status.IsError() {
 				// There is no resource quota assignment for the PodSet - no need to check TAS.
 				continue
 			}
-			psTASRequest, err := podSetTopologyRequest(psAssignment, wl, cq, i)
+			isTASImplied := isTASImplied(&podSet, cq)
+			psTASRequest, err := podSetTopologyRequest(psAssignment, wl, cq, isTASImplied, i)
 			if err != nil {
 				psAssignment.error(err)
 			} else {
@@ -51,13 +52,13 @@ func (a *Assignment) WorkloadsTopologyRequests(wl *workload.Info, cq *cache.Clus
 func podSetTopologyRequest(psAssignment *PodSetAssignment,
 	wl *workload.Info,
 	cq *cache.ClusterQueueSnapshot,
+	isTASImplied bool,
 	podSetIndex int) (*cache.TASPodSetRequests, error) {
 	if len(cq.TASFlavors) == 0 {
 		return nil, errors.New("workload requires Topology, but there is no TAS cache information")
 	}
 	psResources := wl.TotalRequests[podSetIndex]
-	singlePodRequests := psResources.Requests.Clone()
-	singlePodRequests.Divide(int64(psResources.Count))
+	singlePodRequests := psResources.SinglePodRequests()
 	podCount := psAssignment.Count
 	tasFlvr, err := onlyFlavor(psAssignment.Flavors)
 	if err != nil {
@@ -72,6 +73,7 @@ func podSetTopologyRequest(psAssignment *PodSetAssignment,
 		SinglePodRequests: singlePodRequests,
 		PodSet:            podSet,
 		Flavor:            *tasFlvr,
+		Implied:           isTASImplied,
 	}, nil
 }
 
@@ -108,9 +110,25 @@ func checkPodSetAndFlavorMatchForTAS(cq *cache.ClusterQueueSnapshot, ps *kueue.P
 			return ptr.To(fmt.Sprintf("Flavor %q does not contain the requested level", flavor.Name))
 		}
 	}
+	// If this is a TAS-only CQ, then no TopologyRequest is ok
+	if isTASImplied(ps, cq) {
+		return nil
+	}
 	// For PodSets which don't use TAS skip resource flavors which are only for TAS
 	if ps.TopologyRequest == nil && flavor.Spec.TopologyName != nil {
 		return ptr.To(fmt.Sprintf("Flavor %q supports only TopologyAwareScheduling", flavor.Name))
 	}
 	return nil
+}
+
+// isTASImplied returns true if TAS is requested implicitly - there is no
+// explicit
+func isTASImplied(ps *kueue.PodSet, cq *cache.ClusterQueueSnapshot) bool {
+	return ps.TopologyRequest == nil && cq.IsTASOnly()
+}
+
+// isTASRequested checks if TAS is requested for the input PodSet, either
+// explicitly or implicitly.
+func isTASRequested(ps *kueue.PodSet, cq *cache.ClusterQueueSnapshot) bool {
+	return ps.TopologyRequest != nil || cq.IsTASOnly()
 }

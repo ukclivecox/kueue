@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/kueue/apis/config/v1beta1"
@@ -50,14 +49,16 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = ginkgo.BeforeSuite(func() {
-	ctrl.SetLogger(util.NewTestingLogger(ginkgo.GinkgoWriter, -3))
+	util.SetupLogger()
 
 	k8sClient, _ = util.CreateClientUsingCluster("")
 	ctx = context.Background()
 
 	waitForAvailableStart := time.Now()
 	util.WaitForKueueAvailability(ctx, k8sClient)
-	ginkgo.GinkgoLogr.Info("Kueue operator is available in the cluster", "waitingTime", time.Since(waitForAvailableStart))
+	util.WaitForJobSetAvailability(ctx, k8sClient)
+	util.WaitForAppWrapperAvailability(ctx, k8sClient)
+	ginkgo.GinkgoLogr.Info("Kueue, JobSet and AppWrapper operators are available in the cluster", "waitingTime", time.Since(waitForAvailableStart))
 	defaultKueueCfg = util.GetKueueConfiguration(ctx, k8sClient)
 })
 

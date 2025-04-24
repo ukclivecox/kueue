@@ -40,17 +40,15 @@ Use [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus)
 if you don't have your own monitoring system.
 
 The webhook server in kueue uses an internal cert management for provisioning certificates. If you want to use
-  a third-party one, e.g. [cert-manager](https://github.com/cert-manager/cert-manager), follow these steps:
-
-  1. Set `internalCertManagement.enable` to `false` in [config file](#install-a-custom-configured-released-version).
-  2. Comment out the `internalcert` folder in `config/default/kustomization.yaml`.
-  3. Enable `cert-manager` in `config/default/kustomization.yaml` and uncomment all sections with 'CERTMANAGER'.
+  a third-party one, e.g. [cert-manager](https://github.com/cert-manager/cert-manager), follow the [cert manage guide](/docs/tasks/manage/installation).
 
 [feature_gate]: https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/
 
 ## Install a released version
 
-To install a released version of Kueue in your cluster, run the following command:
+### Install by kubectl
+
+To install a released version of Kueue in your cluster by kubectl, run the following command:
 
 ```shell
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/{{< param "version" >}}/manifests.yaml
@@ -62,6 +60,27 @@ To wait for Kueue to be fully available, run:
 kubectl wait deploy/kueue-controller-manager -nkueue-system --for=condition=available --timeout=5m
 ```
 
+### Install by Helm
+
+To install a released version of Kueue in your cluster by [Helm](https://helm.sh/), run the following command:
+
+```shell
+helm install kueue oci://registry.k8s.io/kueue/charts/kueue \
+  --version={{< param "chart_version" >}} \
+  --namespace  kueue-system \
+  --create-namespace \
+  --wait --timeout 300s
+```
+
+You can also use the following command:
+
+```shell
+helm install kueue https://github.com/kubernetes-sigs/kueue/releases/download/{{< param "version" >}}/kueue-chart-{{< param "version" >}}.tgz \
+  --namespace kueue-system \
+  --create-namespace \
+  --wait --timeout 300s
+```
+
 ### Add metrics scraping for prometheus-operator
 
 To allow [prometheus-operator](https://github.com/prometheus-operator/prometheus-operator)
@@ -70,7 +89,7 @@ to scrape metrics from kueue components, run the following command:
 {{% alert title="Note" color="primary" %}}
 This feature depends on [servicemonitor CRD](https://github.com/prometheus-operator/kube-prometheus/blob/main/manifests/setup/0servicemonitorCustomResourceDefinition.yaml), please ensure that CRD is installed first.
 
-We can follow `https://prometheus-operator.dev/docs/prologue/quick-start/` to install it.
+We can follow [Prometheus Operator Installing guide](https://prometheus-operator.dev/docs/getting-started/installation/) to install it.
 {{% /alert %}}
 
 ```shell
@@ -83,10 +102,16 @@ See [Configure API Priority and Fairness](/docs/tasks/manage/monitor_pending_wor
 
 ### Uninstall
 
-To uninstall a released version of Kueue from your cluster, run the following command:
+To uninstall a released version of Kueue from your cluster by kubectl, run the following command:
 
 ```shell
 kubectl delete -f https://github.com/kubernetes-sigs/kueue/releases/download/{{< param "version" >}}/manifests.yaml
+```
+
+To uninstall a released version of Kueue from your cluster by Helm, run the following command:
+
+```shell
+helm uninstall kueue --namespace kueue-system
 ```
 
 ## Install a custom-configured released version

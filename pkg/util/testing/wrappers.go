@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -63,17 +63,25 @@ func (p *PriorityClassWrapper) Obj() *schedulingv1.PriorityClass {
 
 type WorkloadWrapper struct{ kueue.Workload }
 
-// MakeWorkload creates a wrapper for a Workload with a single
-// pod with a single container.
+// MakeWorkload creates a wrapper for a Workload with a single pod
+// with a single container.
 func MakeWorkload(name, ns string) *WorkloadWrapper {
 	return &WorkloadWrapper{kueue.Workload{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: kueue.WorkloadSpec{
 			PodSets: []kueue.PodSet{
-				*MakePodSet("main", 1).Obj(),
+				*MakePodSet(kueue.DefaultPodSetName, 1).Obj(),
 			},
 		},
 	}}
+}
+
+// MakeWorkloadWithGeneratedName creates a wrapper for a Workload with a single pod
+// with a single container.
+func MakeWorkloadWithGeneratedName(namePrefix, ns string) *WorkloadWrapper {
+	wl := MakeWorkload("", ns)
+	wl.GenerateName = namePrefix
+	return wl
 }
 
 func (w *WorkloadWrapper) Obj() *kueue.Workload {
@@ -120,6 +128,10 @@ func (w *WorkloadWrapper) Limit(r corev1.ResourceName, q string) *WorkloadWrappe
 		res.Limits[r] = resource.MustParse(q)
 	}
 	return w
+}
+
+func (w *WorkloadWrapper) RequestAndLimit(r corev1.ResourceName, q string) *WorkloadWrapper {
+	return w.Request(r, q).Limit(r, q)
 }
 
 func (w *WorkloadWrapper) Queue(q string) *WorkloadWrapper {
@@ -363,7 +375,7 @@ func (w *WorkloadWrapper) PastAdmittedTime(v int32) *WorkloadWrapper {
 
 type PodSetWrapper struct{ kueue.PodSet }
 
-func MakePodSet(name string, count int) *PodSetWrapper {
+func MakePodSet(name kueue.PodSetReference, count int) *PodSetWrapper {
 	return &PodSetWrapper{
 		kueue.PodSet{
 			Name:  name,
@@ -487,6 +499,23 @@ func (p *PodSetWrapper) NodeSelector(kv map[string]string) *PodSetWrapper {
 	return p
 }
 
+func (p *PodSetWrapper) RequiredDuringSchedulingIgnoredDuringExecution(nodeSelectorTerms []corev1.NodeSelectorTerm) *PodSetWrapper {
+	if p.Template.Spec.Affinity == nil {
+		p.Template.Spec.Affinity = &corev1.Affinity{}
+	}
+	if p.Template.Spec.Affinity.NodeAffinity == nil {
+		p.Template.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+	if p.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		p.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{}
+	}
+	p.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(
+		p.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		nodeSelectorTerms...,
+	)
+	return p
+}
+
 func (p *PodSetWrapper) NodeName(name string) *PodSetWrapper {
 	p.Template.Spec.NodeName = name
 	return p
@@ -515,7 +544,7 @@ func (p *PodSetWrapper) PodOverHead(resources corev1.ResourceList) *PodSetWrappe
 // AdmissionWrapper wraps an Admission
 type AdmissionWrapper struct{ kueue.Admission }
 
-func MakeAdmission(cq string, podSetNames ...string) *AdmissionWrapper {
+func MakeAdmission(cq string, podSetNames ...kueue.PodSetReference) *AdmissionWrapper {
 	wrap := &AdmissionWrapper{kueue.Admission{
 		ClusterQueue: kueue.ClusterQueueReference(cq),
 	}}
@@ -671,10 +700,10 @@ type CohortWrapper struct {
 	kueuealpha.Cohort
 }
 
-func MakeCohort(name string) *CohortWrapper {
+func MakeCohort(name kueue.CohortReference) *CohortWrapper {
 	return &CohortWrapper{kueuealpha.Cohort{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name: string(name),
 		},
 	}}
 }
@@ -683,7 +712,7 @@ func (c *CohortWrapper) Obj() *kueuealpha.Cohort {
 	return &c.Cohort
 }
 
-func (c *CohortWrapper) Parent(parentName string) *CohortWrapper {
+func (c *CohortWrapper) Parent(parentName kueue.CohortReference) *CohortWrapper {
 	c.Cohort.Spec.Parent = parentName
 	return c
 }
@@ -691,6 +720,14 @@ func (c *CohortWrapper) Parent(parentName string) *CohortWrapper {
 // ResourceGroup adds a ResourceGroup with flavors.
 func (c *CohortWrapper) ResourceGroup(flavors ...kueue.FlavorQuotas) *CohortWrapper {
 	c.Spec.ResourceGroups = append(c.Spec.ResourceGroups, ResourceGroup(flavors...))
+	return c
+}
+
+func (c *CohortWrapper) FairWeight(w resource.Quantity) *CohortWrapper {
+	if c.Spec.FairSharing == nil {
+		c.Spec.FairSharing = &kueue.FairSharing{}
+	}
+	c.Spec.FairSharing.Weight = &w
 	return c
 }
 
@@ -721,7 +758,7 @@ func (c *ClusterQueueWrapper) Obj() *kueue.ClusterQueue {
 }
 
 // Cohort sets the borrowing cohort.
-func (c *ClusterQueueWrapper) Cohort(cohort string) *ClusterQueueWrapper {
+func (c *ClusterQueueWrapper) Cohort(cohort kueue.CohortReference) *ClusterQueueWrapper {
 	c.Spec.Cohort = cohort
 	return c
 }
@@ -826,7 +863,7 @@ func (c *ClusterQueueWrapper) FairWeight(w resource.Quantity) *ClusterQueueWrapp
 	if c.Spec.FairSharing == nil {
 		c.Spec.FairSharing = &kueue.FairSharing{}
 	}
-	c.Spec.FairSharing.Weight = ptr.To(w)
+	c.Spec.FairSharing.Weight = &w
 	return c
 }
 
@@ -1318,6 +1355,12 @@ func (c *ContainerWrapper) Obj() *corev1.Container {
 	return &c.Container
 }
 
+// Name sets the name of the container.
+func (c *ContainerWrapper) Name(name string) *ContainerWrapper {
+	c.Container.Name = name
+	return c
+}
+
 // WithResourceReq appends a resource request to the container.
 func (c *ContainerWrapper) WithResourceReq(resourceName corev1.ResourceName, quantity string) *ContainerWrapper {
 	requests := utilResource.MergeResourceListKeepFirst(c.Container.Resources.Requests, corev1.ResourceList{
@@ -1486,6 +1529,37 @@ func (w *PodTemplateWrapper) Toleration(toleration corev1.Toleration) *PodTempla
 
 func (w *PodTemplateWrapper) ControllerReference(gvk schema.GroupVersionKind, name, uid string) *PodTemplateWrapper {
 	appendOwnerReference(&w.PodTemplate, gvk, name, uid, ptr.To(true), ptr.To(true))
+	return w
+}
+
+type NamespaceWrapper struct {
+	corev1.Namespace
+}
+
+func MakeNamespaceWrapper(name string) *NamespaceWrapper {
+	return &NamespaceWrapper{
+		corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+			},
+		},
+	}
+}
+
+func (w *NamespaceWrapper) Obj() *corev1.Namespace {
+	return &w.Namespace
+}
+
+func (w *NamespaceWrapper) GenerateName(generateName string) *NamespaceWrapper {
+	w.Namespace.GenerateName = generateName
+	return w
+}
+
+func (w *NamespaceWrapper) Label(k, v string) *NamespaceWrapper {
+	if w.ObjectMeta.Labels == nil {
+		w.ObjectMeta.Labels = make(map[string]string)
+	}
+	w.ObjectMeta.Labels[k] = v
 	return w
 }
 

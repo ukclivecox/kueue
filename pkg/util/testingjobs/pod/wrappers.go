@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import (
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 	"sigs.k8s.io/kueue/pkg/constants"
 	controllerconsts "sigs.k8s.io/kueue/pkg/controller/constants"
+	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 )
 
 // PodWrapper wraps a Pod.
@@ -100,7 +101,7 @@ func (p *PodWrapper) Queue(q string) *PodWrapper {
 	return p.Label(controllerconsts.QueueLabel, q)
 }
 
-func (p *PodWrapper) PrebuildWorkload(name string) *PodWrapper {
+func (p *PodWrapper) PrebuiltWorkload(name string) *PodWrapper {
 	return p.Label(controllerconsts.PrebuiltWorkloadLabel, name)
 }
 
@@ -124,12 +125,12 @@ func (p *PodWrapper) Namespace(n string) *PodWrapper {
 
 // Group updates the pod.GroupNameLabel of the Pod
 func (p *PodWrapper) Group(g string) *PodWrapper {
-	return p.Label("kueue.x-k8s.io/pod-group-name", g)
+	return p.Label(podconstants.GroupNameLabel, g)
 }
 
 // GroupTotalCount updates the pod.GroupTotalCountAnnotation of the Pod
 func (p *PodWrapper) GroupTotalCount(gtc string) *PodWrapper {
-	return p.Annotation("kueue.x-k8s.io/pod-group-total-count", gtc)
+	return p.Annotation(podconstants.GroupTotalCountAnnotation, gtc)
 }
 
 // GroupIndex updates the pod.GroupIndexLabel of the Pod
@@ -151,18 +152,22 @@ func (p *PodWrapper) Annotation(key, content string) *PodWrapper {
 	return p
 }
 
-func (p *PodWrapper) PodGroupServingAnnotation(enabled bool) *PodWrapper {
-	return p.Annotation("kueue.x-k8s.io/pod-group-serving", strconv.FormatBool(enabled))
+func (p *PodWrapper) ManagedByKueueLabel() *PodWrapper {
+	return p.Label(constants.ManagedByKueueLabelKey, constants.ManagedByKueueLabelValue)
+}
+
+func (p *PodWrapper) PodGroupServingAnnotation() *PodWrapper {
+	return p.Annotation(podconstants.GroupServingAnnotationKey, podconstants.GroupServingAnnotationValue)
 }
 
 // RoleHash updates the pod.RoleHashAnnotation of the pod
 func (p *PodWrapper) RoleHash(h string) *PodWrapper {
-	return p.Annotation("kueue.x-k8s.io/role-hash", h)
+	return p.Annotation(podconstants.RoleHashAnnotation, h)
 }
 
 // KueueSchedulingGate adds kueue scheduling gate to the Pod
 func (p *PodWrapper) KueueSchedulingGate() *PodWrapper {
-	return p.Gate("kueue.x-k8s.io/admission")
+	return p.Gate(podconstants.SchedulingGateName)
 }
 
 // TopologySchedulingGate adds kueue scheduling gate to the Pod
@@ -191,7 +196,7 @@ func (p *PodWrapper) Finalizer(f string) *PodWrapper {
 
 // KueueFinalizer adds kueue finalizer to the Pod
 func (p *PodWrapper) KueueFinalizer() *PodWrapper {
-	return p.Finalizer(constants.ManagedByKueueLabel)
+	return p.Finalizer(constants.ManagedByKueueLabelKey)
 }
 
 // NodeSelector adds a node selector to the Pod.
@@ -214,6 +219,11 @@ func (p *PodWrapper) NodeName(name string) *PodWrapper {
 func (p *PodWrapper) Request(r corev1.ResourceName, v string) *PodWrapper {
 	p.Spec.Containers[0].Resources.Requests[r] = resource.MustParse(v)
 	return p
+}
+
+// RequestAndLimit adds a resource request and limit to the default container.
+func (p *PodWrapper) RequestAndLimit(r corev1.ResourceName, v string) *PodWrapper {
+	return p.Request(r, v).Limit(r, v)
 }
 
 func (p *PodWrapper) ServiceAccountName(serviceAccountName string) *PodWrapper {

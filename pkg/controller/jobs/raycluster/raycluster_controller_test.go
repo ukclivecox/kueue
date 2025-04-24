@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	testingclock "k8s.io/utils/clock/testing"
@@ -37,6 +36,7 @@ import (
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/podset"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingrayutil "sigs.k8s.io/kueue/pkg/util/testingjobs/raycluster"
@@ -58,8 +58,9 @@ var (
 
 func TestPodSets(t *testing.T) {
 	testCases := map[string]struct {
-		rayCluster  *RayCluster
-		wantPodSets func(rayJob *RayCluster) []kueue.PodSet
+		rayCluster                    *RayCluster
+		wantPodSets                   func(rayJob *RayCluster) []kueue.PodSet
+		enableTopologyAwareScheduling bool
 	}{
 		"no annotations": {
 			rayCluster: (*RayCluster)(testingrayutil.MakeCluster("raycluster", "ns").
@@ -88,23 +89,18 @@ func TestPodSets(t *testing.T) {
 				Obj()),
 			wantPodSets: func(rayJob *RayCluster) []kueue.PodSet {
 				return []kueue.PodSet{
-					{
-						Name:     headGroupPodSetName,
-						Count:    1,
-						Template: *rayJob.Spec.HeadGroupSpec.Template.DeepCopy(),
-					},
-					{
-						Name:     "group1",
-						Count:    1,
-						Template: *rayJob.Spec.WorkerGroupSpecs[0].Template.DeepCopy(),
-					},
-					{
-						Name:     "group2",
-						Count:    3,
-						Template: *rayJob.Spec.WorkerGroupSpecs[1].Template.DeepCopy(),
-					},
+					*utiltesting.MakePodSet(headGroupPodSetName, 1).
+						PodSpec(*rayJob.Spec.HeadGroupSpec.Template.Spec.DeepCopy()).
+						Obj(),
+					*utiltesting.MakePodSet("group1", 1).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[0].Template.Spec.DeepCopy()).
+						Obj(),
+					*utiltesting.MakePodSet("group2", 3).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[1].Template.Spec.DeepCopy()).
+						Obj(),
 				}
 			},
+			enableTopologyAwareScheduling: false,
 		},
 		"with required topology annotation": {
 			rayCluster: (*RayCluster)(testingrayutil.MakeCluster("raycluster", "ns").
@@ -143,25 +139,22 @@ func TestPodSets(t *testing.T) {
 				Obj()),
 			wantPodSets: func(rayJob *RayCluster) []kueue.PodSet {
 				return []kueue.PodSet{
-					{
-						Name:            headGroupPodSetName,
-						Count:           1,
-						Template:        *rayJob.Spec.HeadGroupSpec.Template.DeepCopy(),
-						TopologyRequest: &kueue.PodSetTopologyRequest{Required: ptr.To("cloud.com/block")},
-					},
-					{
-						Name:            "group1",
-						Count:           1,
-						Template:        *rayJob.Spec.WorkerGroupSpecs[0].Template.DeepCopy(),
-						TopologyRequest: &kueue.PodSetTopologyRequest{Required: ptr.To("cloud.com/block")},
-					},
-					{
-						Name:     "group2",
-						Count:    3,
-						Template: *rayJob.Spec.WorkerGroupSpecs[1].Template.DeepCopy(),
-					},
+					*utiltesting.MakePodSet(headGroupPodSetName, 1).
+						PodSpec(*rayJob.Spec.HeadGroupSpec.Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.HeadGroupSpec.Template.Annotations).
+						RequiredTopologyRequest("cloud.com/block").
+						Obj(),
+					*utiltesting.MakePodSet("group1", 1).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[0].Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.WorkerGroupSpecs[0].Template.Annotations).
+						RequiredTopologyRequest("cloud.com/block").
+						Obj(),
+					*utiltesting.MakePodSet("group2", 3).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[1].Template.Spec.DeepCopy()).
+						Obj(),
 				}
 			},
+			enableTopologyAwareScheduling: true,
 		},
 		"with preferred topology annotation": {
 			rayCluster: (*RayCluster)(testingrayutil.MakeCluster("raycluster", "ns").
@@ -200,29 +193,95 @@ func TestPodSets(t *testing.T) {
 				Obj()),
 			wantPodSets: func(rayJob *RayCluster) []kueue.PodSet {
 				return []kueue.PodSet{
-					{
-						Name:            headGroupPodSetName,
-						Count:           1,
-						Template:        *rayJob.Spec.HeadGroupSpec.Template.DeepCopy(),
-						TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: ptr.To("cloud.com/block")},
-					},
-					{
-						Name:     "group1",
-						Count:    1,
-						Template: *rayJob.Spec.WorkerGroupSpecs[0].Template.DeepCopy(),
-					},
-					{
-						Name:            "group2",
-						Count:           3,
-						Template:        *rayJob.Spec.WorkerGroupSpecs[1].Template.DeepCopy(),
-						TopologyRequest: &kueue.PodSetTopologyRequest{Preferred: ptr.To("cloud.com/block")},
-					},
+					*utiltesting.MakePodSet(headGroupPodSetName, 1).
+						PodSpec(*rayJob.Spec.HeadGroupSpec.Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.HeadGroupSpec.Template.Annotations).
+						PreferredTopologyRequest("cloud.com/block").
+						Obj(),
+					*utiltesting.MakePodSet("group1", 1).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[0].Template.Spec.DeepCopy()).
+						Obj(),
+					*utiltesting.MakePodSet("group2", 3).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[1].Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.WorkerGroupSpecs[1].Template.Annotations).
+						PreferredTopologyRequest("cloud.com/block").
+						Obj(),
 				}
 			},
+			enableTopologyAwareScheduling: true,
+		},
+		"without required and preferred topology annotation if TAS is disabled": {
+			rayCluster: (*RayCluster)(testingrayutil.MakeCluster("raycluster", "ns").
+				WithHeadGroupSpec(
+					rayv1.HeadGroupSpec{
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Annotations: map[string]string{
+									kueuealpha.PodSetRequiredTopologyAnnotation: "cloud.com/block",
+								},
+							},
+							Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "head_c"}}},
+						},
+					},
+				).
+				WithWorkerGroups(
+					rayv1.WorkerGroupSpec{
+						GroupName: "group1",
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Annotations: map[string]string{
+									kueuealpha.PodSetRequiredTopologyAnnotation: "cloud.com/block",
+								},
+							},
+							Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "group1_c"}}},
+						},
+					},
+					rayv1.WorkerGroupSpec{
+						GroupName: "group2",
+						Replicas:  ptr.To[int32](3),
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Annotations: map[string]string{
+									kueuealpha.PodSetPreferredTopologyAnnotation: "cloud.com/block",
+								},
+							},
+							Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "group2_c"}}},
+						},
+					},
+					rayv1.WorkerGroupSpec{
+						GroupName: "group3",
+						Replicas:  ptr.To[int32](3),
+						Template: corev1.PodTemplateSpec{
+							Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "group2_c"}}},
+						},
+					},
+				).
+				Obj()),
+			wantPodSets: func(rayJob *RayCluster) []kueue.PodSet {
+				return []kueue.PodSet{
+					*utiltesting.MakePodSet(headGroupPodSetName, 1).
+						PodSpec(*rayJob.Spec.HeadGroupSpec.Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.HeadGroupSpec.Template.Annotations).
+						Obj(),
+					*utiltesting.MakePodSet("group1", 1).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[0].Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.WorkerGroupSpecs[0].Template.Annotations).
+						Obj(),
+					*utiltesting.MakePodSet("group2", 3).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[1].Template.Spec.DeepCopy()).
+						Annotations(rayJob.Spec.WorkerGroupSpecs[1].Template.Annotations).
+						Obj(),
+					*utiltesting.MakePodSet("group3", 3).
+						PodSpec(*rayJob.Spec.WorkerGroupSpecs[2].Template.Spec.DeepCopy()).
+						Obj(),
+				}
+			},
+			enableTopologyAwareScheduling: false,
 		},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			features.SetFeatureGateDuringTest(t, features.TopologyAwareScheduling, tc.enableTopologyAwareScheduling)
 			gotPodSets, err := tc.rayCluster.PodSets()
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -271,44 +330,28 @@ func TestReconciler(t *testing.T) {
 				*utiltesting.MakeWorkload("test", "ns").
 					Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(
-						kueue.PodSet{
-							Name:  "head",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "head-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+						*utiltesting.MakePodSet(headGroupPodSetName, 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("head-container").
+										Obj(),
 								},
-							},
-						},
-						kueue.PodSet{
-							Name:  "workers-group-0",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-
-									Containers: []corev1.Container{
-										{
-											Name: "worker-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: corev1.ResourceList{
-													corev1.ResourceCPU: resource.MustParse("10"),
-												},
-											},
-										},
-									},
+							}).
+							Obj(),
+						*utiltesting.MakePodSet("workers-group-0", 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("worker-container").
+										WithResourceReq(corev1.ResourceCPU, "10").
+										Obj(),
 								},
-							},
-						}).
+							}).
+							Obj(),
+					).
 					Request(corev1.ResourceCPU, "10").
 					ReserveQuota(
 						utiltesting.MakeAdmission("cq", "head", "workers-group-0").
@@ -335,40 +378,27 @@ func TestReconciler(t *testing.T) {
 				*utiltesting.MakeWorkload("a", "ns").
 					Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(
-						kueue.PodSet{
-							Name:  "head",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "head-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+						*utiltesting.MakePodSet(headGroupPodSetName, 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("head-container").
+										Obj(),
 								},
-							},
-						},
-						kueue.PodSet{
-							Name:  "workers-group-0",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "worker-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+							}).
+							Obj(),
+						*utiltesting.MakePodSet("workers-group-0", 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("worker-container").
+										Obj(),
 								},
-							},
-						}).
+							}).
+							Obj(),
+					).
 					ReserveQuota(
 						utiltesting.MakeAdmission("cq", "head", "workers-group-0").
 							Assignment(corev1.ResourceCPU, "unit-test-flavor", "1").
@@ -406,42 +436,27 @@ func TestReconciler(t *testing.T) {
 				*utiltesting.MakeWorkload("test", "ns").
 					Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(
-						kueue.PodSet{
-							Name:  "head",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "head-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+						*utiltesting.MakePodSet(headGroupPodSetName, 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("head-container").
+										Obj(),
 								},
-							},
-						},
-						kueue.PodSet{
-							Name:  "workers-group-0",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "worker-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: corev1.ResourceList{
-													corev1.ResourceCPU: resource.MustParse("10"),
-												},
-											},
-										},
-									},
+							}).
+							Obj(),
+						*utiltesting.MakePodSet("workers-group-0", 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("worker-container").
+										WithResourceReq(corev1.ResourceCPU, "10").
+										Obj(),
 								},
-							},
-						},
+							}).
+							Obj(),
 					).
 					Request(corev1.ResourceCPU, "10").
 					ReserveQuota(utiltesting.MakeAdmission("cq", "head", "workers-group-0").AssignmentPodCount(1).Obj()).
@@ -459,40 +474,27 @@ func TestReconciler(t *testing.T) {
 			wantWorkloads: []kueue.Workload{
 				*utiltesting.MakeWorkload("a", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(
-						kueue.PodSet{
-							Name:  "head",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "head-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+						*utiltesting.MakePodSet(headGroupPodSetName, 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("head-container").
+										Obj(),
 								},
-							},
-						},
-						kueue.PodSet{
-							Name:  "workers-group-0",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "worker-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+							}).
+							Obj(),
+						*utiltesting.MakePodSet("workers-group-0", 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("worker-container").
+										Obj(),
 								},
-							},
-						}).
+							}).
+							Obj(),
+					).
 					ReserveQuota(utiltesting.MakeAdmission("cq", "head", "workers-group-0").AssignmentPodCount(1).Obj()).
 					Generation(1).
 					PastAdmittedTime(1).
@@ -544,44 +546,28 @@ func TestReconciler(t *testing.T) {
 				*utiltesting.MakeWorkload("test", "ns").
 					Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(
-						kueue.PodSet{
-							Name:  "head",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "head-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+						*utiltesting.MakePodSet(headGroupPodSetName, 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("head-container").
+										Obj(),
 								},
-							},
-						},
-						kueue.PodSet{
-							Name:  "workers-group-0",
-							Count: int32(2),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-
-									Containers: []corev1.Container{
-										{
-											Name: "worker-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: corev1.ResourceList{
-													corev1.ResourceCPU: resource.MustParse("10"),
-												},
-											},
-										},
-									},
+							}).
+							Obj(),
+						*utiltesting.MakePodSet("workers-group-0", 2).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("worker-container").
+										WithResourceReq(corev1.ResourceCPU, "10").
+										Obj(),
 								},
-							},
-						}).
+							}).
+							Obj(),
+					).
 					Request(corev1.ResourceCPU, "10").
 					ReserveQuota(
 						utiltesting.MakeAdmission("cq", "head", "workers-group-0").
@@ -608,40 +594,27 @@ func TestReconciler(t *testing.T) {
 				*utiltesting.MakeWorkload("a", "ns").
 					Finalizers(kueue.ResourceInUseFinalizerName).
 					PodSets(
-						kueue.PodSet{
-							Name:  "head",
-							Count: int32(1),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "head-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+						*utiltesting.MakePodSet(headGroupPodSetName, 1).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("head-container").
+										Obj(),
 								},
-							},
-						},
-						kueue.PodSet{
-							Name:  "workers-group-0",
-							Count: int32(2),
-							Template: corev1.PodTemplateSpec{
-								Spec: corev1.PodSpec{
-									RestartPolicy: corev1.RestartPolicyNever,
-									Containers: []corev1.Container{
-										{
-											Name: "worker-container",
-											Resources: corev1.ResourceRequirements{
-												Requests: make(corev1.ResourceList),
-											},
-										},
-									},
+							}).
+							Obj(),
+						*utiltesting.MakePodSet("workers-group-0", 2).
+							PodSpec(corev1.PodSpec{
+								RestartPolicy: corev1.RestartPolicyNever,
+								Containers: []corev1.Container{
+									*utiltesting.MakeContainer().
+										Name("worker-container").
+										Obj(),
 								},
-							},
-						}).
+							}).
+							Obj(),
+					).
 					ReserveQuota(
 						utiltesting.MakeAdmission("cq", "head", "workers-group-0").
 							Assignment(corev1.ResourceCPU, "unit-test-flavor", "1").

@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -121,12 +121,17 @@ func (j *JobSet) PodSets() ([]kueue.PodSet, error) {
 	podSets := make([]kueue.PodSet, len(j.Spec.ReplicatedJobs))
 	for index, replicatedJob := range j.Spec.ReplicatedJobs {
 		podSets[index] = kueue.PodSet{
-			Name:     replicatedJob.Name,
+			Name:     kueue.NewPodSetReference(replicatedJob.Name),
 			Template: *replicatedJob.Template.Spec.Template.DeepCopy(),
 			Count:    podsCount(&replicatedJob),
-			TopologyRequest: jobframework.PodSetTopologyRequest(&replicatedJob.Template.Spec.Template.ObjectMeta,
-				ptr.To(batchv1.JobCompletionIndexAnnotation), ptr.To(jobsetapi.JobIndexKey),
-				ptr.To(replicatedJob.Replicas)),
+		}
+		if features.Enabled(features.TopologyAwareScheduling) {
+			podSets[index].TopologyRequest = jobframework.PodSetTopologyRequest(
+				&replicatedJob.Template.Spec.Template.ObjectMeta,
+				ptr.To(batchv1.JobCompletionIndexAnnotation),
+				ptr.To(jobsetapi.JobIndexKey),
+				ptr.To(replicatedJob.Replicas),
+			)
 		}
 	}
 	return podSets, nil
@@ -144,7 +149,7 @@ func (j *JobSet) RunWithPodSetsInfo(podSetsInfo []podset.PodSetInfo) error {
 		template := &j.Spec.ReplicatedJobs[index].Template.Spec.Template
 		info := podSetsInfo[index]
 		if err := podset.Merge(&template.ObjectMeta, &template.Spec, info); err != nil {
-			return nil
+			return err
 		}
 	}
 	return nil
@@ -198,7 +203,7 @@ func (j *JobSet) ReclaimablePods() ([]kueue.ReclaimablePod, error) {
 		if status, found := statuses[spec.Name]; found && status.Succeeded > 0 {
 			if status.Succeeded > 0 && status.Succeeded <= spec.Replicas {
 				ret = append(ret, kueue.ReclaimablePod{
-					Name:  spec.Name,
+					Name:  kueue.NewPodSetReference(spec.Name),
 					Count: status.Succeeded * podsCountPerReplica(spec),
 				})
 			}

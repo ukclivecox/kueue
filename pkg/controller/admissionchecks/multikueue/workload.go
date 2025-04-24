@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -156,6 +156,7 @@ func (g *wlGroup) RemoveRemoteObjects(ctx context.Context, cluster string) error
 func (w *wlReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 	log.V(2).Info("Reconcile Workload")
+
 	wl := &kueue.Workload{}
 	isDeleted := false
 	err := w.client.Get(ctx, req.NamespacedName, wl)

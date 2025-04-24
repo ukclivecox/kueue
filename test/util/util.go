@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -35,6 +37,7 @@ import (
 	"github.com/onsi/gomega"
 	awv1beta2 "github.com/project-codeflare/appwrapper/api/v1beta2"
 	"github.com/prometheus/client_golang/prometheus"
+	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	zaplog "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	appsv1 "k8s.io/api/apps/v1"
@@ -54,6 +57,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -61,13 +65,29 @@ import (
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
-	"sigs.k8s.io/kueue/pkg/controller/jobs/pod"
+	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption"
 	utiltas "sigs.k8s.io/kueue/pkg/util/tas"
 	"sigs.k8s.io/kueue/pkg/util/testing"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
+
+const (
+	defaultLogLevel = -3
+)
+
+func logLevel() int {
+	level, err := strconv.Atoi(os.Getenv("TEST_LOG_LEVEL"))
+	if err != nil {
+		return defaultLogLevel
+	}
+	return level
+}
+
+var SetupLogger = sync.OnceFunc(func() {
+	ctrl.SetLogger(NewTestingLogger(ginkgo.GinkgoWriter, logLevel()))
+})
 
 type objAsPtr[T any] interface {
 	client.Object
@@ -109,7 +129,7 @@ func DeleteNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace)
 	if ns == nil {
 		return nil
 	}
-	if err := DeleteAllJobsetsInNamespace(ctx, c, ns); err != nil {
+	if err := DeleteAllJobSetsInNamespace(ctx, c, ns); err != nil {
 		return err
 	}
 	if err := DeleteAllJobsInNamespace(ctx, c, ns); err != nil {
@@ -138,55 +158,43 @@ func DeleteNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace)
 }
 
 func DeleteAllJobsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
-	err := c.DeleteAllOf(ctx, &batchv1.Job{}, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return nil
+	return deleteAllObjectsInNamespace(ctx, c, ns, &batchv1.Job{})
 }
 
-func DeleteAllJobsetsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
-	err := c.DeleteAllOf(ctx, &jobset.JobSet{}, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
-	if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, &apimeta.NoKindMatchError{}) {
-		return err
-	}
-	return nil
+func DeleteAllJobSetsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
+	return deleteAllObjectsInNamespace(ctx, c, ns, &jobset.JobSet{})
 }
 
 func DeleteAllLeaderWorkerSetsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
-	err := c.DeleteAllOf(ctx, &leaderworkersetv1.LeaderWorkerSet{}, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
-	if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, &apimeta.NoKindMatchError{}) {
-		return err
-	}
-	return nil
+	return deleteAllObjectsInNamespace(ctx, c, ns, &leaderworkersetv1.LeaderWorkerSet{})
 }
 
 func DeleteAllMPIJobsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
-	err := c.DeleteAllOf(ctx, &kfmpi.MPIJob{}, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
-	if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, &apimeta.NoKindMatchError{}) {
-		return err
-	}
-	return nil
+	return deleteAllObjectsInNamespace(ctx, c, ns, &kfmpi.MPIJob{})
 }
 
 func DeleteAllPyTorchJobsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
-	err := c.DeleteAllOf(ctx, &kftraining.PyTorchJob{}, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
-	if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, &apimeta.NoKindMatchError{}) {
-		return err
-	}
-	return nil
+	return deleteAllObjectsInNamespace(ctx, c, ns, &kftraining.PyTorchJob{})
 }
 
 func DeleteAllAppWrappersInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
-	err := c.DeleteAllOf(ctx, &awv1beta2.AppWrapper{}, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
-	if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, &apimeta.NoKindMatchError{}) {
-		return err
-	}
-	return nil
+	return deleteAllObjectsInNamespace(ctx, c, ns, &awv1beta2.AppWrapper{})
+}
+
+func DeleteAllRayJobsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
+	return deleteAllObjectsInNamespace(ctx, c, ns, &rayv1.RayJob{})
 }
 
 func DeleteAllPodsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace) error {
 	return deleteAllPodsInNamespace(ctx, c, ns, 2)
+}
+
+func deleteAllObjectsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace, obj client.Object) error {
+	err := c.DeleteAllOf(ctx, obj, client.InNamespace(ns.Name), client.PropagationPolicy(metav1.DeletePropagationBackground))
+	if err != nil && !apierrors.IsNotFound(err) && !errors.Is(err, &apimeta.NoKindMatchError{}) {
+		return err
+	}
+	return nil
 }
 
 func deleteAllPodsInNamespace(ctx context.Context, c client.Client, ns *corev1.Namespace, offset int) error {
@@ -198,7 +206,7 @@ func deleteAllPodsInNamespace(ctx context.Context, c client.Client, ns *corev1.N
 		g.Expect(client.IgnoreNotFound(c.List(ctx, &pods, client.InNamespace(ns.Name)))).
 			Should(gomega.Succeed(), "listing Pods with a finalizer in namespace %q", ns.Name)
 		for _, p := range pods.Items {
-			if controllerutil.RemoveFinalizer(&p, pod.PodFinalizer) {
+			if controllerutil.RemoveFinalizer(&p, podconstants.PodFinalizer) {
 				g.Expect(client.IgnoreNotFound(c.Update(ctx, &p))).Should(gomega.Succeed(), "removing finalizer")
 			}
 		}
@@ -209,8 +217,8 @@ func deleteAllPodsInNamespace(ctx context.Context, c client.Client, ns *corev1.N
 func ExpectAllPodsInNamespaceDeleted(ctx context.Context, c client.Client, ns *corev1.Namespace) {
 	pods := corev1.PodList{}
 	gomega.Eventually(func(g gomega.Gomega) {
-		g.Expect(c.List(ctx, &pods, client.InNamespace(ns.Name))).Should(gomega.Succeed())
-		g.Expect(pods.Items).Should(gomega.BeEmpty())
+		g.ExpectWithOffset(1, c.List(ctx, &pods, client.InNamespace(ns.Name))).Should(gomega.Succeed())
+		g.ExpectWithOffset(1, pods.Items).Should(gomega.BeEmpty())
 	}, LongTimeout, Interval).Should(gomega.Succeed())
 }
 
@@ -614,7 +622,7 @@ func ExpectLocalQueueResourceReservationsMetric(queue *kueue.LocalQueue, flavorN
 }
 
 func ExpectCQResourceNominalQuota(cq *kueue.ClusterQueue, flavor, resource string, value float64) {
-	metric := metrics.ClusterQueueResourceNominalQuota.WithLabelValues(cq.Spec.Cohort, cq.Name, flavor, resource)
+	metric := metrics.ClusterQueueResourceNominalQuota.WithLabelValues(string(cq.Spec.Cohort), cq.Name, flavor, resource)
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		v, err := testutil.GetGaugeMetricValue(metric)
 		g.Expect(err).ToNot(gomega.HaveOccurred())
@@ -623,7 +631,7 @@ func ExpectCQResourceNominalQuota(cq *kueue.ClusterQueue, flavor, resource strin
 }
 
 func ExpectCQResourceBorrowingQuota(cq *kueue.ClusterQueue, flavor, resource string, value float64) {
-	metric := metrics.ClusterQueueResourceBorrowingLimit.WithLabelValues(cq.Spec.Cohort, cq.Name, flavor, resource)
+	metric := metrics.ClusterQueueResourceBorrowingLimit.WithLabelValues(string(cq.Spec.Cohort), cq.Name, flavor, resource)
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		v, err := testutil.GetGaugeMetricValue(metric)
 		g.Expect(err).ToNot(gomega.HaveOccurred())
@@ -632,7 +640,7 @@ func ExpectCQResourceBorrowingQuota(cq *kueue.ClusterQueue, flavor, resource str
 }
 
 func ExpectCQResourceReservations(cq *kueue.ClusterQueue, flavor, resource string, value float64) {
-	metric := metrics.ClusterQueueResourceReservations.WithLabelValues(cq.Spec.Cohort, cq.Name, flavor, resource)
+	metric := metrics.ClusterQueueResourceReservations.WithLabelValues(string(cq.Spec.Cohort), cq.Name, flavor, resource)
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		v, err := testutil.GetGaugeMetricValue(metric)
 		g.Expect(err).ToNot(gomega.HaveOccurred())
@@ -773,7 +781,7 @@ func ExpectPodUnsuspendedWithNodeSelectors(ctx context.Context, k8sClient client
 	createdPod := &corev1.Pod{}
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, key, createdPod)).To(gomega.Succeed())
-		g.Expect(createdPod.Spec.SchedulingGates).NotTo(gomega.ContainElement(corev1.PodSchedulingGate{Name: pod.SchedulingGateName}))
+		g.Expect(createdPod.Spec.SchedulingGates).NotTo(gomega.ContainElement(corev1.PodSchedulingGate{Name: podconstants.SchedulingGateName}))
 		g.Expect(createdPod.Spec.NodeSelector).To(gomega.BeComparableTo(ns))
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
@@ -839,7 +847,7 @@ readCh:
 	gomega.ExpectWithOffset(1, gotObjs).To(gomega.Equal(objs))
 }
 
-func ExpectPreemptedCondition(ctx context.Context, k8sClient client.Client, reason string, status metav1.ConditionStatus, preemptedWl, preempteeWl *kueue.Workload) {
+func ExpectPreemptedCondition(ctx context.Context, k8sClient client.Client, reason string, status metav1.ConditionStatus, preemptedWl, preempteeWl *kueue.Workload, preemteeWorkloadUID, preempteeJobUID string) {
 	conditionCmpOpts := cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration")
 	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
 		g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(preemptedWl), preemptedWl)).To(gomega.Succeed())
@@ -847,7 +855,7 @@ func ExpectPreemptedCondition(ctx context.Context, k8sClient client.Client, reas
 			Type:    kueue.WorkloadPreempted,
 			Status:  status,
 			Reason:  reason,
-			Message: fmt.Sprintf("Preempted to accommodate a workload (UID: %s) due to %s", preempteeWl.UID, preemption.HumanReadablePreemptionReasons[reason]),
+			Message: fmt.Sprintf("Preempted to accommodate a workload (UID: %s, JobUID: %s) due to %s", preemteeWorkloadUID, preempteeJobUID, preemption.HumanReadablePreemptionReasons[reason]),
 		}, conditionCmpOpts)))
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
@@ -876,9 +884,7 @@ func ExpectClusterQueuesToBeActive(ctx context.Context, c client.Client, cqs ...
 		readCq := &kueue.ClusterQueue{}
 		for _, cq := range cqs {
 			g.Expect(c.Get(ctx, client.ObjectKeyFromObject(cq), readCq)).To(gomega.Succeed())
-			cond := apimeta.FindStatusCondition(readCq.Status.Conditions, kueue.ClusterQueueActive)
-			g.Expect(cond).NotTo(gomega.BeNil(), "no %q condition found in %q cq status", kueue.ClusterQueueActive, cq.Name)
-			g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue), "%q is not active status: %q message: %q", cq.Name, cond.Status, cond.Message)
+			g.Expect(readCq.Status.Conditions).To(testing.HaveConditionStatusTrue(kueue.ClusterQueueActive))
 		}
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
@@ -888,14 +894,21 @@ func ExpectLocalQueuesToBeActive(ctx context.Context, c client.Client, lqs ...*k
 		readLq := &kueue.LocalQueue{}
 		for _, lq := range lqs {
 			g.Expect(c.Get(ctx, client.ObjectKeyFromObject(lq), readLq)).To(gomega.Succeed())
-			cond := apimeta.FindStatusCondition(readLq.Status.Conditions, kueue.LocalQueueActive)
-			g.Expect(cond).NotTo(gomega.BeNil(), "no %q condition found in %q cq status", kueue.LocalQueueActive, lq.Name)
-			g.Expect(cond.Status).To(gomega.Equal(metav1.ConditionTrue), "%q is not active status: %q message: %q", lq.Name, cond.Status, cond.Message)
+			g.Expect(readLq.Status.Conditions).To(testing.HaveConditionStatusTrue(kueue.LocalQueueActive))
 		}
 	}, Timeout, Interval).Should(gomega.Succeed())
 }
 
-func CreateNodes(ctx context.Context, c client.Client, nodes []corev1.Node) {
+func ExpectJobUnsuspendedWithNodeSelectors(ctx context.Context, c client.Client, key types.NamespacedName, nodeSelector map[string]string) {
+	job := &batchv1.Job{}
+	gomega.EventuallyWithOffset(1, func(g gomega.Gomega) {
+		g.Expect(c.Get(ctx, key, job)).To(gomega.Succeed())
+		g.Expect(job.Spec.Suspend).Should(gomega.Equal(ptr.To(false)))
+		g.Expect(job.Spec.Template.Spec.NodeSelector).Should(gomega.Equal(nodeSelector))
+	}, Timeout, Interval).Should(gomega.Succeed())
+}
+
+func CreateNodesWithStatus(ctx context.Context, c client.Client, nodes []corev1.Node) {
 	for _, node := range nodes {
 		// 1. Create a node
 		gomega.ExpectWithOffset(1, c.Create(ctx, &node)).Should(gomega.Succeed())
@@ -967,8 +980,41 @@ func KExecute(ctx context.Context, cfg *rest.Config, client *rest.RESTClient, ns
 	return out.Bytes(), outErr.Bytes(), nil
 }
 
+// GetProjectBaseDir retrieves the project base directory either from an environment variable or by searching for a Makefile.
+// The fallback to the search is useful for running in IDEs like vs-code which don't set the PROJECT_DIR env. variable by default.
 func GetProjectBaseDir() string {
-	return filepath.Dir(os.Getenv("PROJECT_DIR"))
+	projectBasePath, found := os.LookupEnv("PROJECT_DIR")
+	if found {
+		return filepath.Dir(projectBasePath)
+	}
+
+	projectBaseDir, err := findMakefileDir()
+	if err != nil {
+		klog.Error(err)
+		return ""
+	}
+	return projectBaseDir
+}
+
+// findMakefileDir traverses directories upward from the current directory until it finds a directory containing a Makefile.
+func findMakefileDir() (string, error) {
+	startDir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("could not get current working directory: %w", err)
+	}
+
+	for {
+		makefilePath := filepath.Join(startDir, "Makefile")
+		if _, err := os.Stat(makefilePath); err == nil {
+			return startDir, nil
+		}
+
+		parentDir := filepath.Dir(startDir)
+		if parentDir == startDir {
+			return "", errors.New("not able to locate Makefile")
+		}
+		startDir = parentDir
+	}
 }
 
 func FindDeploymentCondition(deployment *appsv1.Deployment, deploymentType appsv1.DeploymentConditionType) *appsv1.DeploymentCondition {
@@ -979,4 +1025,12 @@ func FindDeploymentCondition(deployment *appsv1.Deployment, deploymentType appsv
 		}
 	}
 	return nil
+}
+
+func GetListOptsFromLabel(label string) *client.ListOptions {
+	selector, err := labels.Parse(label)
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	return &client.ListOptions{
+		LabelSelector: selector,
+	}
 }

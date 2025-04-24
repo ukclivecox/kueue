@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ import (
 
 	"sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
-	podcontroller "sigs.k8s.io/kueue/pkg/controller/jobs/pod"
+	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 	"sigs.k8s.io/kueue/pkg/queue"
 )
 
@@ -72,20 +72,27 @@ func (wh *Webhook) Default(ctx context.Context, obj runtime.Object) error {
 	}
 	if suspend {
 		if lws.Spec.LeaderWorkerTemplate.LeaderTemplate != nil {
-			wh.podTemplateSpecDefault(lws.Spec.LeaderWorkerTemplate.LeaderTemplate)
+			wh.podTemplateSpecDefault(lws, lws.Spec.LeaderWorkerTemplate.LeaderTemplate)
 		}
-		wh.podTemplateSpecDefault(&lws.Spec.LeaderWorkerTemplate.WorkerTemplate)
+		wh.podTemplateSpecDefault(lws, &lws.Spec.LeaderWorkerTemplate.WorkerTemplate)
 	}
 
 	return nil
 }
 
-func (wh *Webhook) podTemplateSpecDefault(podTemplateSpec *corev1.PodTemplateSpec) {
-	if podTemplateSpec.Annotations == nil {
-		podTemplateSpec.Annotations = make(map[string]string, 1)
+func (wh *Webhook) podTemplateSpecDefault(lws *LeaderWorkerSet, podTemplateSpec *corev1.PodTemplateSpec) {
+	if priorityClass := jobframework.WorkloadPriorityClassName(lws.Object()); priorityClass != "" {
+		if podTemplateSpec.Labels == nil {
+			podTemplateSpec.Labels = make(map[string]string, 1)
+		}
+		podTemplateSpec.Labels[constants.WorkloadPriorityClassLabel] = priorityClass
 	}
-	podTemplateSpec.Annotations[podcontroller.SuspendedByParentAnnotation] = FrameworkName
-	podTemplateSpec.Annotations[podcontroller.GroupServingAnnotation] = "true"
+
+	if podTemplateSpec.Annotations == nil {
+		podTemplateSpec.Annotations = make(map[string]string, 2)
+	}
+	podTemplateSpec.Annotations[podconstants.SuspendedByParentAnnotation] = FrameworkName
+	podTemplateSpec.Annotations[podconstants.GroupServingAnnotationKey] = podconstants.GroupServingAnnotationValue
 }
 
 // +kubebuilder:webhook:path=/validate-leaderworkerset-x-k8s-io-v1-leaderworkerset,mutating=false,failurePolicy=fail,sideEffects=None,groups="leaderworkerset.x-k8s.io",resources=leaderworkersets,verbs=create;update,versions=v1,name=vleaderworkerset.kb.io,admissionReviewVersions=v1
@@ -176,7 +183,7 @@ func validateTopologyRequest(lws *LeaderWorkerSet) field.ErrorList {
 }
 
 func validateImmutablePodTemplateSpec(newPodTemplateSpec *corev1.PodTemplateSpec, oldPodTemplateSpec *corev1.PodTemplateSpec, fieldPath *field.Path) field.ErrorList {
-	allErrors := field.ErrorList{}
+	var allErrors field.ErrorList
 	if newPodTemplateSpec == nil || oldPodTemplateSpec == nil {
 		allErrors = append(allErrors, apivalidation.ValidateImmutableField(newPodTemplateSpec, oldPodTemplateSpec, fieldPath)...)
 	} else {

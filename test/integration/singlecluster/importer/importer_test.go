@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -44,12 +43,7 @@ var _ = ginkgo.Describe("Importer", func() {
 	)
 
 	ginkgo.BeforeEach(func() {
-		ns = &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "import-",
-			},
-		}
-		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		ns = util.CreateNamespaceFromPrefixWithLog(ctx, k8sClient, "import-")
 
 		flavor = utiltesting.MakeResourceFlavor("f1").Obj()
 		gomega.Expect(k8sClient.Create(ctx, flavor)).To(gomega.Succeed())
@@ -124,7 +118,7 @@ var _ = ginkgo.Describe("Importer", func() {
 
 			pod3 := utiltestingpod.MakePod("pod3", ns.Name).
 				Queue("lq1").
-				Label(constants.ManagedByKueueLabel, "true").
+				Label(constants.ManagedByKueueLabelKey, constants.ManagedByKueueLabelValue).
 				Request(corev1.ResourceCPU, "2").
 				KueueSchedulingGate().
 				Obj()

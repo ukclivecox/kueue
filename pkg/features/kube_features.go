@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -150,7 +150,19 @@ const (
 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
 	//
 	// Enable to set use LeastAlloactedFit algorithm for TAS
-	TASLeastAllocated featuregate.Feature = "TASLeastAllocated"
+	TASProfileMostFreeCapacity featuregate.Feature = "TASProfileMostFreeCapacity"
+
+	// owner: @pbundyra
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
+	//
+	// Enable to set use LeastAlloactedFit algorithm for TAS
+	TASProfileLeastFreeCapacity featuregate.Feature = "TASProfileLeastFreeCapacity"
+
+	// owner: @pbundyra
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/2724-topology-aware-scheduling
+	//
+	// Enable to set use LeastAlloactedFit algorithm for TAS
+	TASProfileMixed featuregate.Feature = "TASProfileMixed"
 )
 
 func init() {
@@ -231,7 +243,13 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 	LocalQueueDefaulting: {
 		{Version: version.MustParse("0.10"), Default: false, PreRelease: featuregate.Alpha},
 	},
-	TASLeastAllocated: {
+	TASProfileMostFreeCapacity: {
+		{Version: version.MustParse("0.11"), Default: false, PreRelease: featuregate.Deprecated},
+	},
+	TASProfileLeastFreeCapacity: {
+		{Version: version.MustParse("0.11"), Default: false, PreRelease: featuregate.Deprecated},
+	},
+	TASProfileMixed: {
 		{Version: version.MustParse("0.11"), Default: false, PreRelease: featuregate.Deprecated},
 	},
 }

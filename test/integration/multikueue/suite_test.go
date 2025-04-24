@@ -1,5 +1,5 @@
 /*
-Copyright 2023 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -326,11 +326,7 @@ var _ = ginkgo.BeforeSuite(func() {
 	managerK8sVersion, err = kubeversion.FetchServerVersion(discoveryClient)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
-	managersConfigNamespace = &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "kueue-system",
-		},
-	}
+	managersConfigNamespace = utiltesting.MakeNamespace("kueue-system")
 	gomega.Expect(managerTestCluster.client.Create(managerTestCluster.ctx, managersConfigNamespace)).To(gomega.Succeed())
 })
 

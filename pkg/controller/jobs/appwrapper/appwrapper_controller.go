@@ -1,5 +1,5 @@
 /*
-Copyright 2025 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ package appwrapper
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 
 	awv1beta2 "github.com/project-codeflare/appwrapper/api/v1beta2"
@@ -28,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -38,7 +41,7 @@ import (
 )
 
 var (
-	gvk = awv1beta2.GroupVersion.WithKind("AppWrapper")
+	gvk = awv1beta2.GroupVersion.WithKind(awv1beta2.AppWrapperKind)
 
 	FrameworkName = "workload.codeflare.dev/appwrapper"
 
@@ -83,7 +86,7 @@ func NewJob() jobframework.GenericJob {
 }
 
 func isAppWrapper(owner *metav1.OwnerReference) bool {
-	return owner.Kind == "AppWrapper" && strings.HasPrefix(owner.APIVersion, gvk.Group)
+	return owner.Kind == awv1beta2.AppWrapperKind && strings.HasPrefix(owner.APIVersion, gvk.Group)
 }
 
 func SetupIndexes(ctx context.Context, indexer client.FieldIndexer) error {
@@ -120,20 +123,60 @@ func (aw *AppWrapper) GVK() schema.GroupVersionKind {
 }
 
 func (aw *AppWrapper) PodSets() ([]kueue.PodSet, error) {
-	podSets, err := awutils.GetPodSets((*awv1beta2.AppWrapper)(aw))
+	podSpecTemplates, awPodSets, err := awutils.GetComponentPodSpecs((*awv1beta2.AppWrapper)(aw))
 	if err != nil {
-		ctrl.Log.Error(err, "Error returned from awutils.GetPodSets", "appwrapper", aw)
+		ctrl.Log.Error(err, "Error returned from awutils.GetComponentPodSpecs", "appwrapper", aw)
 		return nil, err
 	}
-	for idx := range podSets {
-		podSets[idx].TopologyRequest = jobframework.PodSetTopologyRequest(&podSets[idx].Template.ObjectMeta, nil, nil, nil)
+	podSets := make([]kueue.PodSet, len(podSpecTemplates))
+	for psIndex := range podSpecTemplates {
+		var podIndexLabel *string
+		var subGroupIndexLabel *string
+		var subGroupCount *int32
+		if annotation, ok := awPodSets[psIndex].Annotations[awutils.PodSetAnnotationTASPodIndexLabel]; ok {
+			podIndexLabel = &annotation
+		}
+		if annotation, ok := awPodSets[psIndex].Annotations[awutils.PodSetAnnotationTASSubGroupIndexLabel]; ok {
+			subGroupIndexLabel = &annotation
+		}
+		if annotation, ok := awPodSets[psIndex].Annotations[awutils.PodSetAnnotationTASSubGroupCount]; ok {
+			if count, err := strconv.Atoi(annotation); err == nil {
+				subGroupCount = ptr.To(int32(count))
+			} else {
+				ctrl.Log.Error(err, "Malformed annotation ignored",
+					"annotationKey", awutils.PodSetAnnotationTASSubGroupCount,
+					"annotationValue", annotation)
+			}
+		}
+		podSets[psIndex] = kueue.PodSet{
+			Name:     kueue.NewPodSetReference(fmt.Sprintf("%s-%v", aw.Name, psIndex)),
+			Template: *podSpecTemplates[psIndex],
+			Count:    awutils.Replicas(awPodSets[psIndex]),
+		}
+		if features.Enabled(features.TopologyAwareScheduling) {
+			podSets[psIndex].TopologyRequest = jobframework.PodSetTopologyRequest(
+				&(podSpecTemplates[psIndex].ObjectMeta),
+				podIndexLabel,
+				subGroupIndexLabel,
+				subGroupCount,
+			)
+		}
 	}
 	return podSets, nil
 }
 
 func (aw *AppWrapper) RunWithPodSetsInfo(podSetsInfo []podset.PodSetInfo) error {
-	if err := awutils.SetPodSetInfos((*awv1beta2.AppWrapper)(aw), podSetsInfo); err != nil {
-		return err
+	awPodSetsInfo := make([]awv1beta2.AppWrapperPodSetInfo, len(podSetsInfo))
+	for idx := range podSetsInfo {
+		awPodSetsInfo[idx].Annotations = podSetsInfo[idx].Annotations
+		awPodSetsInfo[idx].Labels = podSetsInfo[idx].Labels
+		awPodSetsInfo[idx].NodeSelector = podSetsInfo[idx].NodeSelector
+		awPodSetsInfo[idx].Tolerations = podSetsInfo[idx].Tolerations
+		awPodSetsInfo[idx].SchedulingGates = podSetsInfo[idx].SchedulingGates
+	}
+
+	if err := awutils.SetPodSetInfos((*awv1beta2.AppWrapper)(aw), awPodSetsInfo); err != nil {
+		return fmt.Errorf("%w: %w", podset.ErrInvalidPodsetInfo, err)
 	}
 	aw.Spec.Suspend = false
 	return nil

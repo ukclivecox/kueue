@@ -85,6 +85,7 @@ managerConfig:
     #waitForPodsReady:
     #  enable: false
     #  timeout: 5m
+    #  recoveryTimeout: 3m
     #  blockAdmission: false
     #  requeuingStrategy:
     #    timestamp: Eviction
@@ -119,12 +120,6 @@ managerConfig:
     #  - "leaderworkerset.x-k8s.io/leaderworkerset" (requires enabling pod integration)
     #  externalFrameworks:
     #  - "Foo.v1.example.com"
-    #  podOptions:
-    #    namespaceSelector:
-    #      matchExpressions:
-    #        - key: kubernetes.io/metadata.name
-    #          operator: NotIn
-    #          values: [ kube-system, kueue-system ]
     #fairSharing:
     #  enable: true
     #  preemptionStrategies: [LessThanOrEqualToFinalShare, LessThanInitialShare]
@@ -139,10 +134,10 @@ managerConfig:
 # ports definition for metricsService and webhookService.
 metricsService:
   ports:
-    - name: https
+    - name: metrics
       port: 8443
       protocol: TCP
-      targetPort: https
+      targetPort: 8443
   type: ClusterIP
   annotations: {}
 webhookService:
@@ -160,3 +155,11 @@ webhookService:
     - key: kubernetes.io/metadata.name
       operator: In
       values: [ ray ]
+# kueue-viz dashboard
+enableKueueViz: false
+
+metrics:
+  prometheusNamespace: monitoring
+  serviceMonitor:
+    tlsConfig:
+      insecureSkipVerify: true

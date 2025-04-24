@@ -1,11 +1,11 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-	http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -41,6 +41,18 @@ func NewRequests(rl corev1.ResourceList) Requests {
 
 func (r Requests) Clone() Requests {
 	return maps.Clone(r)
+}
+
+func (r Requests) ScaledUp(f int64) Requests {
+	ret := r.Clone()
+	ret.Mul(f)
+	return ret
+}
+
+func (r Requests) ScaledDown(f int64) Requests {
+	ret := r.Clone()
+	ret.Divide(f)
+	return ret
 }
 
 func (r Requests) Divide(f int64) {

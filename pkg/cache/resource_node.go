@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Kubernetes Authors.
+Copyright The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,10 +17,7 @@ limitations under the License.
 package cache
 
 import (
-	"errors"
 	"maps"
-
-	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/kueue/pkg/hierarchy"
 	"sigs.k8s.io/kueue/pkg/resources"
@@ -146,16 +143,6 @@ func removeUsage(node hierarchicalResourceNode, fr resources.FlavorResource, val
 	removeUsage(node.parentHRN(), fr, deltaParentUsage)
 }
 
-// calculateLendable aggregates capacity for resources across all
-// FlavorResources.
-func (r ResourceNode) calculateLendable() map[corev1.ResourceName]int64 {
-	lendable := make(map[corev1.ResourceName]int64, len(r.SubtreeQuota))
-	for fr, q := range r.SubtreeQuota {
-		lendable[fr.Resource] += q
-	}
-	return lendable
-}
-
 func updateClusterQueueResourceNode(cq *clusterQueue) {
 	cq.AllocatableResourceGeneration++
 	cq.resourceNode.SubtreeQuota = make(resources.FlavorResourceQuantities, len(cq.resourceNode.Quotas))
@@ -167,9 +154,9 @@ func updateClusterQueueResourceNode(cq *clusterQueue) {
 // updateCohortTreeResources traverses the Cohort tree from the root
 // to accumulate SubtreeQuota and Usage. It returns an error if the
 // provided Cohort has a cycle.
-func updateCohortTreeResources(cohort *cohort, cycleChecker hierarchy.CycleChecker) error {
-	if cycleChecker.HasCycle(cohort) {
-		return errors.New("cohort has a cycle")
+func updateCohortTreeResources(cohort *cohort) error {
+	if hierarchy.HasCycle(cohort) {
+		return ErrCohortHasCycle
 	}
 	updateCohortResourceNode(cohort.getRootUnsafe())
 	return nil
